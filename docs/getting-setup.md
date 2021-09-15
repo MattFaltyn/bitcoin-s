@@ -48,6 +48,8 @@ title: Getting Bitcoin-S installed on your machine
 
 To get started you will need Java, Scala, and some other nice tools installed, luckily the Scala team has an easy [setup process](https://docs.scala-lang.org/getting-started/index.html) which we quickly go over below!
 
+COURSIER DOESNT WORK
+
 For Linux and macOS users, make sure you have installed Homebrew. You can find the Linux install guide [here](https://docs.brew.sh/Homebrew-on-Linux) and the macOS guide [here](https://brew.sh/).
 
 Now, you can use the following command to install `cs`, the Scala installer tool that automatically installs all the requirements, and start the setup. `cs` that ensures that a JVM and standard Scala tools are installed on your system. 
