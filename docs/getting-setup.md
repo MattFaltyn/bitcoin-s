@@ -27,7 +27,7 @@ title: Getting Bitcoin-S installed on your machine
 
 <!-- END doctoc generated TOC please keep comment here to allow auto update -->
 
-## LAST UPDATED
+## Last Updated
 
 - Sept 14, 2021
 - 12:32 PM PST
