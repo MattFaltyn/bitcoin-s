@@ -5,7 +5,7 @@ title: Getting Bitcoin-S installed on your machine
 
 > This documentation is intended for setting up development of bitcoin-s.
 > If you want to just install bitcoin-s rather than develop, 
-> see [getting-started](getting-started.md)
+> see [getting-started](getting-started.md).
 
 ## Getting Setup With Bitcoin-S
 
@@ -27,15 +27,34 @@ title: Getting Bitcoin-S installed on your machine
 
 <!-- END doctoc generated TOC please keep comment here to allow auto update -->
 
+## LAST UPDATED
 
-## Step 1: Developer Runtimes
+- Sept 14, 2021
+- 12:32 PM PST
+
+## OS/Hardware Recommendations
+
+- Ubuntu 20.04
+- 4 CPU's 
+- 32 GiB
+- 100 GB storage
+
+
+## Step 1: Development Enviroment
+
+### 
 
 ### Scala/Java
-To get started you will need Java, Scala, and some other nice tools installed, luckily the Scala team has an easy setup process!
 
-Simply follow the instructions in [this short blog](https://www.scala-lang.org/2020/06/29/one-click-install.html) to get started.
+To get started you will need Java, Scala, and some other nice tools installed, luckily the Scala team has an easy [setup process](https://docs.scala-lang.org/getting-started/index.html) which we quickly go over below!
 
-If you don't like `curl`, you can use OS specific package managers to install coursier [here](https://get-coursier.io/docs/2.0.0-RC2/cli-overview.html#installation)
+For Linux and macOS users, make sure you have installed Homebrew. You can find the Linux install guide [here](https://docs.brew.sh/Homebrew-on-Linux) and the macOS guide [here](https://brew.sh/).
+
+Now, you can use the following command to install `cs`, the Scala installer tool that automatically installs all the requirements, and start the setup. `cs` that ensures that a JVM and standard Scala tools are installed on your system. 
+
+```
+brew install coursier/formulas/coursier && cs setup
+```
 
 >bitcoin-s requires java9+ for development environments. If you do not have java9+ installed, you will not be able to build bitcoin-s.
 [You will run into this error if you are on java8 or lower](https://github.com/bitcoin-s/bitcoin-s/issues/3298)
