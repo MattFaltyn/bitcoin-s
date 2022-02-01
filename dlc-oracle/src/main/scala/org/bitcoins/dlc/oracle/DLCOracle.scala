@@ -5,8 +5,8 @@ import grizzled.slf4j.Logging
 import org.bitcoins.core.api.dlcoracle._
 import org.bitcoins.core.api.dlcoracle.db._
 import org.bitcoins.core.config.BitcoinNetwork
-import org.bitcoins.core.crypto.ExtKeyVersion.SegWitMainNetPriv
-import org.bitcoins.core.crypto.{ExtPrivateKeyHardened, MnemonicCode}
+import org.bitcoins.core.crypto.ExtKeyVersion.SegWitTestNet3Priv
+import org.bitcoins.core.crypto.{ExtPrivateKeyHardened, ExtPublicKey}
 import org.bitcoins.core.hd._
 import org.bitcoins.core.number._
 import org.bitcoins.core.protocol.Bech32Address
@@ -16,10 +16,12 @@ import org.bitcoins.core.protocol.tlv._
 import org.bitcoins.core.util.sorted.OrderedNonces
 import org.bitcoins.core.util.{FutureUtil, NumberUtil, TimeUtil}
 import org.bitcoins.crypto._
+import org.bitcoins.db.models.MasterXPubDAO
+import org.bitcoins.db.util.MasterXPubUtil
 import org.bitcoins.dlc.oracle.config.DLCOracleAppConfig
 import org.bitcoins.dlc.oracle.storage._
 import org.bitcoins.dlc.oracle.util.EventDbUtil
-import org.bitcoins.keymanager.{DecryptedMnemonic, WalletStorage}
+import org.bitcoins.keymanager.WalletStorage
 import scodec.bits.ByteVector
 
 import java.nio.file.Path
@@ -54,10 +56,12 @@ case class DLCOracle()(implicit val conf: DLCOracleAppConfig)
   /** The root private key for this oracle */
   private[this] val extPrivateKey: ExtPrivateKeyHardened = {
     WalletStorage.getPrivateKeyFromDisk(conf.kmConf.seedPath,
-                                        SegWitMainNetPriv,
+                                        SegWitTestNet3Priv,
                                         conf.aesPasswordOpt,
                                         conf.bip39PasswordOpt)
   }
+
+  def getRootXpub: ExtPublicKey = extPrivateKey.extPublicKey
 
   private def signingKey: ECPrivateKey = {
     val coin = HDCoin(HDPurposes.SegWit, coinType)
@@ -80,6 +84,9 @@ case class DLCOracle()(implicit val conf: DLCOracleAppConfig)
   protected[bitcoins] val rValueDAO: RValueDAO = RValueDAO()
   protected[bitcoins] val eventDAO: EventDAO = EventDAO()
   protected[bitcoins] val eventOutcomeDAO: EventOutcomeDAO = EventOutcomeDAO()
+
+  protected[bitcoins] val masterXpubDAO: MasterXPubDAO =
+    MasterXPubDAO()(ec, conf)
 
   private lazy val nextKeyIndexF: Future[AtomicInteger] =
     rValueDAO.maxKeyIndex.map {
@@ -119,8 +126,25 @@ case class DLCOracle()(implicit val conf: DLCOracleAppConfig)
   override def listPendingEventDbs(): Future[Vector[EventDb]] =
     eventDAO.getPendingEvents
 
+  override def listCompletedEventDbs(): Future[Vector[EventDb]] =
+    eventDAO.getCompletedEvents
+
   override def listEvents(): Future[Vector[OracleEvent]] = {
     eventDAO.findAll().map { eventDbs =>
+      val events = eventDbs.groupBy(_.announcementSignature)
+      events.values.map(dbs => OracleEvent.fromEventDbs(dbs)).toVector
+    }
+  }
+
+  override def listPendingEvents(): Future[Vector[OracleEvent]] = {
+    listPendingEventDbs().map { eventDbs =>
+      val events = eventDbs.groupBy(_.announcementSignature)
+      events.values.map(dbs => OracleEvent.fromEventDbs(dbs)).toVector
+    }
+  }
+
+  override def listCompletedEvents(): Future[Vector[OracleEvent]] = {
+    listCompletedEventDbs().map { eventDbs =>
       val events = eventDbs.groupBy(_.announcementSignature)
       events.values.map(dbs => OracleEvent.fromEventDbs(dbs)).toVector
     }
@@ -143,7 +167,7 @@ case class DLCOracle()(implicit val conf: DLCOracleAppConfig)
     }
   }
 
-  override def createNewDigitDecompEvent(
+  override def createNewDigitDecompAnnouncement(
       eventName: String,
       maturationTime: Instant,
       base: UInt16,
@@ -161,10 +185,10 @@ case class DLCOracle()(implicit val conf: DLCOracleAppConfig)
                                                                unit,
                                                                precision)
 
-    createNewEvent(eventName, maturationTime, descriptorTLV)
+    createNewAnnouncement(eventName, maturationTime, descriptorTLV)
   }
 
-  override def createNewEnumEvent(
+  override def createNewEnumAnnouncement(
       eventName: String,
       maturationTime: Instant,
       outcomes: Vector[String]): Future[OracleAnnouncementTLV] = {
@@ -174,10 +198,10 @@ case class DLCOracle()(implicit val conf: DLCOracleAppConfig)
 
     val descriptorTLV = EnumEventDescriptorV0TLV(outcomes)
 
-    createNewEvent(eventName, maturationTime, descriptorTLV)
+    createNewAnnouncement(eventName, maturationTime, descriptorTLV)
   }
 
-  override def createNewEvent(
+  override def createNewAnnouncement(
       eventName: String,
       maturationTime: Instant,
       descriptor: EventDescriptorTLV,
@@ -242,7 +266,7 @@ case class DLCOracle()(implicit val conf: DLCOracleAppConfig)
     }
   }
 
-  override def signEnumEvent(
+  override def signEnum(
       eventName: String,
       outcome: EnumAttestation): Future[EventDb] = {
     for {
@@ -250,11 +274,11 @@ case class DLCOracle()(implicit val conf: DLCOracleAppConfig)
       _ = require(eventDbs.size == 1,
                   "Use signLargeRange for signing multi nonce outcomes")
 
-      sign <- signEvent(eventDbs.head.nonce, outcome)
+      sign <- createAttestation(eventDbs.head.nonce, outcome)
     } yield sign
   }
 
-  override def signEnumEvent(
+  override def signEnum(
       oracleEventTLV: OracleEventTLV,
       outcome: EnumAttestation): Future[EventDb] = {
     for {
@@ -262,14 +286,14 @@ case class DLCOracle()(implicit val conf: DLCOracleAppConfig)
       _ = require(eventDbs.size == 1,
                   "Use signLargeRange for signing multi nonce outcomes")
 
-      sign <- signEvent(eventDbs.head.nonce, outcome)
+      sign <- createAttestation(eventDbs.head.nonce, outcome)
     } yield sign
   }
 
   /** Signs the event for the single nonce
     * This will be called multiple times by signDigits for each nonce
     */
-  override def signEvent(
+  override def createAttestation(
       nonce: SchnorrNonce,
       outcome: DLCAttestationType): Future[EventDb] = {
     for {
@@ -350,15 +374,10 @@ case class DLCOracle()(implicit val conf: DLCOracleAppConfig)
       eventDescriptorTLV match {
         case _: SignedDigitDecompositionEventDescriptor =>
           val signOutcome = DigitDecompositionSignAttestation(num >= 0)
-          signEvent(oracleEventTLV.nonces.head, signOutcome).map(db =>
+          createAttestation(oracleEventTLV.nonces.head, signOutcome).map(db =>
             Vector(db))
         case _: UnsignedDigitDecompositionEventDescriptor =>
-          if (num >= 0) {
-            FutureUtil.emptyVec[EventDb]
-          } else {
-            Future.failed(new IllegalArgumentException(
-              s"Cannot sign a negative number for an unsigned event, got $num"))
-          }
+          FutureUtil.emptyVec[EventDb]
       }
 
     val boundedNum = if (num < eventDescriptorTLV.minNum) {
@@ -384,7 +403,7 @@ case class DLCOracle()(implicit val conf: DLCOracleAppConfig)
 
     val digitSigFs = nonces.zipWithIndex.map { case (nonce, index) =>
       val digit = decomposed(index)
-      signEvent(nonce, DigitDecompositionAttestation(digit))
+      createAttestation(nonce, DigitDecompositionAttestation(digit))
     }
 
     for {
@@ -399,17 +418,45 @@ case class DLCOracle()(implicit val conf: DLCOracleAppConfig)
     signingKey.schnorrSign(hash.bytes)
   }
 
+  /** @inheritdoc */
+  override def deleteAnnouncement(
+      eventName: String): Future[OracleAnnouncementTLV] = {
+    logger.warn(s"Deleting announcement with name=$eventName")
+    for {
+      eventOpt <- findEvent(eventName)
+      _ = require(eventOpt.isDefined,
+                  s"No announcement found by event name $eventName")
+      event = eventOpt.get
+      eventDbs <- eventDAO.findByOracleEventTLV(event.eventTLV)
+      _ = require(
+        eventDbs.forall(_.attestationOpt.isEmpty),
+        s"Cannot have attesations defined when deleting an announcement, name=$eventName")
+      nonces = eventDbs.map(_.nonce)
+      rVals <- rValueDAO.findByNonces(nonces)
+      outcomeDbs <- eventOutcomeDAO.findByNonces(nonces)
+      _ <- eventOutcomeDAO.deleteAll(outcomeDbs)
+      _ <- rValueDAO.deleteAll(rVals)
+      _ <- eventDAO.deleteAll(eventDbs)
+    } yield eventOpt.get.announcementTLV
+  }
+
+  /** @inheritdoc */
+  override def deleteAnnouncement(
+      announcementTLV: OracleAnnouncementTLV): Future[OracleAnnouncementTLV] = {
+    deleteAnnouncement(announcementTLV.eventTLV.eventId.toString)
+  }
+
   /** Deletes attestations for the given event
     *
     * WARNING: if previous signatures have been made public
     * the oracle private key will be revealed.
     */
-  override def deleteAttestations(eventName: String): Future[OracleEvent] = {
+  override def deleteAttestation(eventName: String): Future[OracleEvent] = {
     for {
       eventOpt <- findEvent(eventName)
       _ = require(eventOpt.isDefined,
                   s"No event found by event name $eventName")
-      res <- deleteAttestations(eventOpt.get.eventTLV)
+      res <- deleteAttestation(eventOpt.get.eventTLV)
     } yield res
   }
 
@@ -418,7 +465,7 @@ case class DLCOracle()(implicit val conf: DLCOracleAppConfig)
     * WARNING: if previous signatures have been made public
     * the oracle private key will be revealed.
     */
-  override def deleteAttestations(
+  override def deleteAttestation(
       oracleEventTLV: OracleEventTLV): Future[OracleEvent] = {
     for {
       eventDbs <- eventDAO.findByOracleEventTLV(oracleEventTLV)
@@ -429,6 +476,14 @@ case class DLCOracle()(implicit val conf: DLCOracleAppConfig)
       _ <- eventDAO.updateAll(updated)
     } yield OracleEvent.fromEventDbs(eventDbs)
   }
+
+  override def oracleName(): Future[Option[String]] = {
+    masterXpubDAO.findXPub().map(_.name)
+  }
+
+  override def setOracleName(name: String): Future[Unit] = {
+    masterXpubDAO.updateName(name)
+  }
 }
 
 object DLCOracle {
@@ -436,30 +491,17 @@ object DLCOracle {
   // 585 is a random one I picked, unclaimed in https://github.com/satoshilabs/slips/blob/master/slip-0044.md
   val R_VALUE_PURPOSE = 585
 
-  def apply(mnemonicCode: MnemonicCode)(implicit
-      conf: DLCOracleAppConfig): DLCOracle = {
-    val decryptedMnemonic = DecryptedMnemonic(mnemonicCode, TimeUtil.now)
-    val toWrite = conf.aesPasswordOpt match {
-      case Some(password) => decryptedMnemonic.encrypt(password)
-      case None           => decryptedMnemonic
-    }
-    if (!conf.seedExists()) {
-      WalletStorage.writeSeedToDisk(conf.kmConf.seedPath, toWrite)
-    }
-
-    new DLCOracle()
-  }
-
   /** Gets the DLC oracle from the given datadir */
   def fromDatadir(path: Path, configs: Vector[Config])(implicit
       ec: ExecutionContext): Future[DLCOracle] = {
     implicit val appConfig =
       DLCOracleAppConfig.fromDatadir(datadir = path, configs)
-
+    val masterXpubDAO: MasterXPubDAO = MasterXPubDAO()(ec, appConfig)
     val oracle = DLCOracle()
 
     for {
       _ <- appConfig.start()
+      _ <- MasterXPubUtil.checkMasterXPub(oracle.getRootXpub, masterXpubDAO)
       differentKeyDbs <- oracle.eventDAO.findDifferentPublicKey(
         oracle.publicKey)
       fixedDbs = differentKeyDbs.map(_.copy(pubkey = oracle.publicKey))

@@ -53,11 +53,15 @@ class LandingPaneModel(serverArgParser: ServerArgParser)(implicit
               Future.successful(ConfigFactory.empty())
             case BitcoindBackend =>
               if (!appConfig.torConf.enabled) {
-                tmpConf.bitcoindRpcConf.client.getBlockChainInfo.map { info =>
-                  val networkStr =
-                    DatadirUtil.networkStrToDirName(info.chain.name)
-                  ConfigFactory.parseString(s"bitcoin-s.network = $networkStr")
-                }
+                val bitcoindF = tmpConf.bitcoindRpcConf.clientF
+                bitcoindF
+                  .flatMap(_.getBlockChainInfo)
+                  .map { info =>
+                    val networkStr =
+                      DatadirUtil.networkStrToDirName(info.chain.name)
+                    ConfigFactory.parseString(
+                      s"bitcoin-s.network = $networkStr")
+                  }
               } else {
                 //we cannot connect to bitcoind and determine
                 //the network over tor since tor isn't started
@@ -76,13 +80,8 @@ class LandingPaneModel(serverArgParser: ServerArgParser)(implicit
 
         // Launch wallet
         val promise = Promise[Unit]()
-        BitcoinSServer.startedF.map { _ =>
-          fetchStartingData()
-          changeToWalletGUIScene()
-          promise.success(())
-        }
 
-        val startedF = networkConfigF.map { networkConfig =>
+        val startedF: Future[Unit] = networkConfigF.flatMap { networkConfig =>
           val finalAppConfig =
             BitcoinSAppConfig.fromDatadir(appConfig.nodeConf.baseDatadir,
                                           networkConfig)
@@ -91,8 +90,15 @@ class LandingPaneModel(serverArgParser: ServerArgParser)(implicit
           GlobalData.setBitcoinNetwork(
             finalAppConfig.nodeConf.network,
             finalAppConfig.nodeConf.socks5ProxyParams.isDefined)
-          new BitcoinSServerMain(serverArgParser)(system, finalAppConfig)
-            .run()
+          val runF =
+            new BitcoinSServerMain(serverArgParser)(system, finalAppConfig)
+              .run()
+
+          runF.map { _ =>
+            fetchStartingData()
+            changeToWalletGUIScene()
+            promise.success(())
+          }
         }
 
         startedF.failed.foreach { case err =>

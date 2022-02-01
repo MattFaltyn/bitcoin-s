@@ -28,6 +28,7 @@ import scodec.bits.ByteVector
 case class DLCTxBuilder(offer: DLCOffer, accept: DLCAcceptWithoutSigs) {
 
   val DLCOffer(_,
+               _,
                DLCPublicKeys(offerFundingKey: ECPublicKey,
                              offerFinalAddress: BitcoinAddress),
                offerTotalCollateral: Satoshis,
@@ -91,8 +92,10 @@ case class DLCTxBuilder(offer: DLCOffer, accept: DLCAcceptWithoutSigs) {
   val acceptTotalFunding: CurrencyUnit =
     acceptFundingInputs.map(_.output.value).sum
 
-  require(offer.tempContractId == tempContractId,
-          "Offer and accept (without sigs) must refer to same event")
+  require(
+    offer.tempContractId == tempContractId,
+    s"Offer and accept (without sigs) must refer to same event, offer.tempContractId=${offer.tempContractId.hex} tempContractId=${tempContractId.hex}"
+  )
   require(acceptFinalAddress.networkParameters == network,
           "Offer and accept (without sigs) must be on the same network")
   require(offerChangeAddress.networkParameters == network,
@@ -139,19 +142,21 @@ case class DLCTxBuilder(offer: DLCOffer, accept: DLCAcceptWithoutSigs) {
 
   /** Constructs the unsigned funding transaction */
   lazy val buildFundingTx: Transaction = {
-    DLCTxBuilder.buildFundingTransaction(
-      offerInput = offerTotalCollateral,
-      acceptInput = acceptTotalCollateral,
-      offerFundingInputs = offerFundingInputs,
-      acceptFundingInputs = acceptFundingInputs,
-      offerChangeSPK = offerChangeAddress.scriptPubKey,
-      offerChangeSerialId = offerChangeSerialId,
-      acceptChangeSPK = acceptChangeAddress.scriptPubKey,
-      acceptChangeSerialId = acceptChangeSerialId,
-      fundingSPK = fundingSPK,
-      fundOutputSerialId = fundOutputSerialId,
-      finalizer = fundingTxFinalizer
-    )
+    DLCTxBuilder
+      .buildFundingTransaction(
+        offerInput = offerTotalCollateral,
+        acceptInput = acceptTotalCollateral,
+        offerFundingInputs = offerFundingInputs,
+        acceptFundingInputs = acceptFundingInputs,
+        offerChangeSPK = offerChangeAddress.scriptPubKey,
+        offerChangeSerialId = offerChangeSerialId,
+        acceptChangeSPK = acceptChangeAddress.scriptPubKey,
+        acceptChangeSerialId = acceptChangeSerialId,
+        fundingSPK = fundingSPK,
+        fundOutputSerialId = fundOutputSerialId,
+        finalizer = fundingTxFinalizer
+      )
+      ._1
   }
 
   // Need to build funding tx so it takes into account the dust threshold
@@ -167,7 +172,9 @@ case class DLCTxBuilder(offer: DLCOffer, accept: DLCAcceptWithoutSigs) {
   }
 
   lazy val calcContractId: ByteVector = {
-    DLCUtil.computeContractId(fundingTx, accept.tempContractId)
+    DLCUtil.computeContractId(fundingTx = fundingTx,
+                              outputIdx = fundOutputIndex,
+                              tempContractId = accept.tempContractId)
   }
 
   /** Constructs the unsigned Contract Execution Transaction (CET)
@@ -257,6 +264,9 @@ object DLCTxBuilder {
     )
   }
 
+  /** Builds the funding transaction for a DLC
+    * @return the transaction and the output index of the funding output
+    */
   def buildFundingTransaction(
       offerInput: CurrencyUnit,
       acceptInput: CurrencyUnit,
@@ -268,7 +278,7 @@ object DLCTxBuilder {
       acceptChangeSerialId: UInt64,
       fundingSPK: P2WSHWitnessSPKV0,
       fundOutputSerialId: UInt64,
-      finalizer: DualFundingTxFinalizer): Transaction = {
+      finalizer: DualFundingTxFinalizer): (Transaction, Int) = {
     // The total collateral of both parties combined
     val totalInput: CurrencyUnit = offerInput + acceptInput
 
@@ -308,20 +318,34 @@ object DLCTxBuilder {
     val acceptChangeValue =
       acceptTotalFunding - acceptInput - finalizer.acceptFees
 
+    val fundingOutput = TransactionOutput(fundingValue, fundingSPK)
+    val offererChangeOutput =
+      TransactionOutput(offerChangeValue, offerChangeSPK)
+    val acceptorChangeOutput =
+      TransactionOutput(acceptChangeValue, acceptChangeSPK)
     val outputsWithSerialId = Vector(
-      (TransactionOutput(fundingValue, fundingSPK), fundOutputSerialId),
-      (TransactionOutput(offerChangeValue, offerChangeSPK),
-       offerChangeSerialId),
-      (TransactionOutput(acceptChangeValue, acceptChangeSPK),
-       acceptChangeSerialId)
+      (fundingOutput, fundOutputSerialId),
+      (offererChangeOutput, offerChangeSerialId),
+      (acceptorChangeOutput, acceptChangeSerialId)
     )
 
     val outputs = sortAndFilterOutputs(outputsWithSerialId)
 
-    BaseTransaction(TransactionConstants.validLockVersion,
-                    inputs,
-                    outputs,
-                    UInt32.zero)
+    val btx = BaseTransaction(TransactionConstants.validLockVersion,
+                              inputs,
+                              outputs,
+                              UInt32.zero)
+    val changeSPKs = Vector(offererChangeOutput.scriptPubKey,
+                            acceptorChangeOutput.scriptPubKey)
+    val outputIdx = btx.outputs.zipWithIndex
+      .filterNot { case (output, _) =>
+        changeSPKs.contains(output.scriptPubKey)
+      }
+      .map(_._2)
+
+    require(outputIdx.length == 1,
+            s"Can only have one funding output idx, got=$outputIdx")
+    (btx, outputIdx.head)
   }
 
   def buildCET(

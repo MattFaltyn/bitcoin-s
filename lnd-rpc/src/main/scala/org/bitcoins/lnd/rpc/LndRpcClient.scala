@@ -1,21 +1,26 @@
 package org.bitcoins.lnd.rpc
 
+import akka.NotUsed
 import akka.actor.ActorSystem
 import akka.grpc.{GrpcClientSettings, SSLContextUtils}
+import akka.stream.scaladsl.{Sink, Source}
 import com.google.protobuf.ByteString
 import grizzled.slf4j.Logging
 import io.grpc.{CallCredentials, Metadata}
+import lnrpc.ChannelPoint.FundingTxid.FundingTxidBytes
+import lnrpc.CloseStatusUpdate.Update.ClosePending
 import lnrpc._
 import org.bitcoins.commons.jsonmodels.lnd._
 import org.bitcoins.commons.util.NativeProcessFactory
 import org.bitcoins.core.currency._
 import org.bitcoins.core.number.UInt32
-import org.bitcoins.core.protocol.BitcoinAddress
+import org.bitcoins.core.protocol._
 import org.bitcoins.core.protocol.ln.LnInvoice
 import org.bitcoins.core.protocol.ln.LnTag.PaymentHashTag
 import org.bitcoins.core.protocol.ln.currency.MilliSatoshis
 import org.bitcoins.core.protocol.ln.node.NodeId
 import org.bitcoins.core.protocol.script._
+import org.bitcoins.core.protocol.tlv._
 import org.bitcoins.core.protocol.transaction.{
   TransactionOutPoint,
   TransactionOutput,
@@ -28,12 +33,17 @@ import org.bitcoins.core.wallet.fee.{SatoshisPerKW, SatoshisPerVirtualByte}
 import org.bitcoins.crypto._
 import org.bitcoins.lnd.rpc.LndRpcClient._
 import org.bitcoins.lnd.rpc.LndUtils._
-import org.bitcoins.lnd.rpc.config.{LndInstance, LndInstanceLocal}
-import scodec.bits.ByteVector
+import org.bitcoins.lnd.rpc.config._
+import scodec.bits._
 import signrpc._
-import walletrpc.{FinalizePsbtRequest, SendOutputsRequest, WalletKitClient}
+import walletrpc.{
+  AddressType => _,
+  ListUnspentRequest => _,
+  Transaction => _,
+  _
+}
 
-import java.io.{File, FileInputStream}
+import java.io._
 import java.net.InetSocketAddress
 import java.util.concurrent.Executor
 import java.util.concurrent.atomic.AtomicInteger
@@ -52,20 +62,33 @@ class LndRpcClient(val instance: LndInstance, binaryOpt: Option[File] = None)(
     case _: LndInstanceLocal =>
       require(binaryOpt.isDefined,
               s"Binary must be defined with a local instance of lnd")
+    case _: LndInstanceRemote => ()
   }
 
   /** The command to start the daemon on the underlying OS */
   override def cmd: String = instance match {
     case local: LndInstanceLocal =>
       s"${binaryOpt.get} --lnddir=${local.datadir.toAbsolutePath}"
+    case _: LndInstanceRemote => ""
   }
 
   implicit val executionContext: ExecutionContext = system.dispatcher
 
   // These need to be lazy so we don't try and fetch
   // the tls certificate before it is generated
-
-  private[this] lazy val certStream = new FileInputStream(instance.certFile)
+  private[this] lazy val certStreamOpt: Option[InputStream] = {
+    instance.certFileOpt match {
+      case Some(file) => Some(new FileInputStream(file))
+      case None =>
+        instance.certificateOpt match {
+          case Some(cert) =>
+            Some(
+              new ByteArrayInputStream(
+                cert.getBytes(java.nio.charset.StandardCharsets.UTF_8.name)))
+          case None => None
+        }
+    }
+  }
 
   private lazy val callCredentials = new CallCredentials {
 
@@ -87,11 +110,21 @@ class LndRpcClient(val instance: LndInstance, binaryOpt: Option[File] = None)(
   }
 
   // Configure the client
-  private lazy val clientSettings: GrpcClientSettings =
-    GrpcClientSettings
+  private lazy val clientSettings: GrpcClientSettings = {
+    val trustManagerOpt = certStreamOpt match {
+      case Some(stream) => Some(SSLContextUtils.trustManagerFromStream(stream))
+      case None         => None
+    }
+
+    val client = GrpcClientSettings
       .connectToServiceAt(instance.rpcUri.getHost, instance.rpcUri.getPort)
-      .withTrustManager(SSLContextUtils.trustManagerFromStream(certStream))
       .withCallCredentials(callCredentials)
+
+    trustManagerOpt match {
+      case Some(trustManager) => client.withTrustManager(trustManager)
+      case None               => client
+    }
+  }
 
   // Create a client-side stub for the services
   lazy val lnd: LightningClient = LightningClient(clientSettings)
@@ -163,11 +196,35 @@ class LndRpcClient(val instance: LndInstance, binaryOpt: Option[File] = None)(
   }
 
   def addInvoice(
+      descriptionHash: Sha256Digest,
+      value: Satoshis,
+      expiry: Long): Future[AddInvoiceResult] = {
+    val invoice: Invoice =
+      Invoice(value = value.toLong,
+              expiry = expiry,
+              descriptionHash = descriptionHash.bytes)
+
+    addInvoice(invoice)
+  }
+
+  def addInvoice(
       memo: String,
       value: MilliSatoshis,
       expiry: Long): Future[AddInvoiceResult] = {
     val invoice: Invoice =
       Invoice(memo = memo, valueMsat = value.toLong, expiry = expiry)
+
+    addInvoice(invoice)
+  }
+
+  def addInvoice(
+      descriptionHash: Sha256Digest,
+      value: MilliSatoshis,
+      expiry: Long): Future[AddInvoiceResult] = {
+    val invoice: Invoice =
+      Invoice(valueMsat = value.toLong,
+              expiry = expiry,
+              descriptionHash = descriptionHash.bytes)
 
     addInvoice(invoice)
   }
@@ -185,6 +242,10 @@ class LndRpcClient(val instance: LndInstance, binaryOpt: Option[File] = None)(
           res.paymentAddr
         )
       }
+  }
+
+  def subscribeInvoices(): Source[Invoice, NotUsed] = {
+    lnd.subscribeInvoices(InvoiceSubscription())
   }
 
   def getNewAddress: Future[BitcoinAddress] = {
@@ -318,6 +379,60 @@ class LndRpcClient(val instance: LndInstance, binaryOpt: Option[File] = None)(
           case None => None
         }
       }
+  }
+
+  def closeChannel(
+      outPoint: TransactionOutPoint,
+      force: Boolean,
+      feeRate: SatoshisPerVirtualByte): Future[TransactionOutPoint] = {
+    val channelPoint =
+      ChannelPoint(FundingTxidBytes(outPoint.txId.bytes), outPoint.vout.toInt)
+
+    closeChannel(
+      CloseChannelRequest(channelPoint = Some(channelPoint),
+                          force = force,
+                          satPerVbyte = feeRate.toLong))
+  }
+
+  def closeChannel(
+      outPoint: TransactionOutPoint): Future[TransactionOutPoint] = {
+    val channelPoint =
+      ChannelPoint(FundingTxidBytes(outPoint.txId.bytes), outPoint.vout.toInt)
+    closeChannel(CloseChannelRequest(Some(channelPoint)))
+  }
+
+  def closeChannel(
+      request: CloseChannelRequest): Future[TransactionOutPoint] = {
+    logger.trace("lnd calling closechannel")
+
+    lnd
+      .closeChannel(request)
+      .map(_.update)
+      .filter(_.isClosePending)
+      .runWith(Sink.head)
+      .collect { case ClosePending(closeUpdate) =>
+        val txId = DoubleSha256Digest(closeUpdate.txid)
+        val vout = UInt32(closeUpdate.outputIndex)
+        TransactionOutPoint(txId, vout)
+      }
+  }
+
+  def abandonChannel(
+      outPoint: TransactionOutPoint,
+      pendingFundingShimOnly: Boolean): Future[Unit] = {
+    val channelPoint: ChannelPoint = outPoint
+    val request =
+      AbandonChannelRequest(Some(channelPoint),
+                            pendingFundingShimOnly = pendingFundingShimOnly,
+                            iKnowWhatIAmDoing = true)
+
+    abandonChannel(request)
+  }
+
+  def abandonChannel(request: AbandonChannelRequest): Future[Unit] = {
+    logger.trace("lnd calling abandonChannel")
+
+    lnd.abandonChannel(request).map(_ => ())
   }
 
   def listChannels(request: ListChannelsRequest =
@@ -471,6 +586,101 @@ class LndRpcClient(val instance: LndInstance, binaryOpt: Option[File] = None)(
 
         (scriptSig, witness)
       }.toVector
+    }
+  }
+
+  def listLeases(): Future[Vector[UTXOLease]] = {
+    listLeases(ListLeasesRequest())
+  }
+
+  def listLeases(request: ListLeasesRequest): Future[Vector[UTXOLease]] = {
+    logger.trace("lnd calling listleases")
+
+    wallet
+      .listLeases(request)
+      .map(_.lockedUtxos.toVector.map { lease =>
+        val txId = DoubleSha256DigestBE(lease.outpoint.get.txidBytes)
+        val vout = UInt32(lease.outpoint.get.outputIndex)
+        val outPoint = TransactionOutPoint(txId, vout)
+        UTXOLease(lease.id, outPoint, lease.expiration)
+      })
+  }
+
+  def leaseOutput(
+      outpoint: TransactionOutPoint,
+      leaseSeconds: Long): Future[Long] = {
+    val outPoint =
+      OutPoint(outpoint.txId.bytes, outputIndex = outpoint.vout.toInt)
+
+    val request = LeaseOutputRequest(id = LndRpcClient.leaseId,
+                                     outpoint = Some(outPoint),
+                                     expirationSeconds = leaseSeconds)
+
+    leaseOutput(request)
+  }
+
+  /** LeaseOutput locks an output to the given ID, preventing it from being available for any future coin selection attempts.
+    * The absolute time of the lock's expiration is returned.
+    * The expiration of the lock can be extended by successive invocations of this RPC.
+    * @param request LeaseOutputRequest
+    * @return Unix timestamp for when the lease expires
+    */
+  def leaseOutput(request: LeaseOutputRequest): Future[Long] = {
+    logger.trace("lnd calling leaseoutput")
+
+    wallet.leaseOutput(request).map(_.expiration)
+  }
+
+  def releaseOutput(outpoint: TransactionOutPoint): Future[Unit] = {
+    val outPoint =
+      OutPoint(outpoint.txId.bytes, outputIndex = outpoint.vout.toInt)
+
+    val request =
+      ReleaseOutputRequest(id = LndRpcClient.leaseId, outpoint = Some(outPoint))
+
+    releaseOutput(request)
+  }
+
+  def releaseOutput(request: ReleaseOutputRequest): Future[Unit] = {
+    logger.trace("lnd calling releaseoutput")
+
+    wallet.releaseOutput(request).map(_ => ())
+  }
+
+  def sendCustomMessage(
+      peer: NodeId,
+      lnMessage: LnMessage[TLV]): Future[Unit] = {
+    sendCustomMessage(peer, lnMessage.tlv)
+  }
+
+  def sendCustomMessage(peer: NodeId, tlv: TLV): Future[Unit] = {
+    sendCustomMessage(peer, tlv.tpe, tlv.value)
+  }
+
+  def sendCustomMessage(
+      peer: NodeId,
+      tpe: BigSizeUInt,
+      data: ByteVector): Future[Unit] = {
+    val request = SendCustomMessageRequest(peer = peer.bytes,
+                                           `type` = tpe.toInt,
+                                           data = data)
+    sendCustomMessage(request)
+  }
+
+  def sendCustomMessage(request: SendCustomMessageRequest): Future[Unit] = {
+    logger.trace("lnd calling sendcustommessage")
+
+    lnd.sendCustomMessage(request).map(_ => ())
+  }
+
+  def subscribeCustomMessages(): Source[(NodeId, TLV), NotUsed] = {
+    lnd.subscribeCustomMessages(SubscribeCustomMessagesRequest()).map {
+      response =>
+        val nodeId = NodeId(response.peer)
+        val tpe = BigSizeUInt(response.`type`)
+        val tlv = TLV.fromTypeAndValue(tpe, response.data)
+
+        (nodeId, tlv)
     }
   }
 
@@ -639,8 +849,14 @@ class LndRpcClient(val instance: LndInstance, binaryOpt: Option[File] = None)(
 
 object LndRpcClient {
 
+  /** Lease id should be unique per application
+    * this is the sha256 of "lnd bitcoin-s"
+    */
+  val leaseId: ByteString =
+    hex"8c45ee0b90e3afd0fb4d6f39afa3c5d551ee5f2c7ac2d06820ed3d16582186d2"
+
   /** The current version we support of Lnd */
-  private[bitcoins] val version = "0.13.1"
+  private[bitcoins] val version = "v0.14.1-beta"
 
   /** Key used for adding the macaroon to the gRPC header */
   private[lnd] val macaroonKey = "macaroon"

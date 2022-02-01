@@ -70,6 +70,8 @@ sealed trait BitcoindInstanceLocal extends BitcoindInstance {
         BitcoindVersion.V20
       case _: String if foundVersion.startsWith(BitcoindVersion.V21.toString) =>
         BitcoindVersion.V21
+      case _: String if foundVersion.startsWith(BitcoindVersion.V22.toString) =>
+        BitcoindVersion.V22
       case _: String => BitcoindVersion.Unknown
     }
   }
@@ -264,7 +266,7 @@ object BitcoindInstanceRemote
     require(file.exists, s"${file.getPath} does not exist!")
     require(file.isFile, s"${file.getPath} is not a file!")
 
-    val conf = BitcoindRpcAppConfig(file.toPath)
+    val conf = BitcoindRpcAppConfig(file.toPath, Vector.empty)
     fromConfig(conf)
   }
 
@@ -291,7 +293,7 @@ object BitcoindInstanceRemote
       system: ActorSystem): BitcoindInstanceRemote = {
     require(dir.exists, s"${dir.getPath} does not exist!")
     require(dir.isDirectory, s"${dir.getPath} is not a directory!")
-    val conf = BitcoindRpcAppConfig(dir.toPath)
+    val conf = BitcoindRpcAppConfig(dir.toPath, Vector.empty)
     fromConfig(conf)
   }
 }

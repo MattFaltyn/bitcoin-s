@@ -8,6 +8,7 @@ import org.bitcoins.core.wallet.fee.SatoshisPerByte
 import org.bitcoins.crypto.ECPublicKey
 import org.bitcoins.server.BitcoinSAppConfig
 import org.bitcoins.testkit.BitcoinSTestAppConfig
+import org.bitcoins.testkit.async.TestAsyncUtil
 import org.bitcoins.testkit.node.{
   NeutrinoNodeFundedWalletBitcoind,
   NodeTestUtil,
@@ -42,25 +43,22 @@ class NeutrinoNodeWithWalletTest extends NodeTestWithCachedBitcoindNewest {
 
   val TestAmount = 1.bitcoin
   val FeeRate = SatoshisPerByte(10.sats)
-  val TestFees: Satoshis = 2230.sats
+  val TestFees: Satoshis = 2220.sats
 
   it must "receive information about received payments" in { param =>
     val NeutrinoNodeFundedWalletBitcoind(node, wallet, bitcoind, _) = param
 
     def condition(
-        expectedConfirmedAmount: CurrencyUnit,
-        expectedUnconfirmedAmount: CurrencyUnit,
+        expectedBalance: CurrencyUnit,
         expectedUtxos: Int,
         expectedAddresses: Int): Future[Boolean] = {
       for {
-        confirmedBalance <- wallet.getConfirmedBalance()
-        unconfirmedBalance <- wallet.getUnconfirmedBalance()
+        balance <- wallet.getBalance()
         addresses <- wallet.listAddresses()
         utxos <- wallet.listDefaultAccountUtxos()
       } yield {
         // +- fee rate because signatures could vary in size
-        (expectedConfirmedAmount === confirmedBalance +- FeeRate.currencyUnit) &&
-        (expectedUnconfirmedAmount === unconfirmedBalance +- FeeRate.currencyUnit) &&
+        (expectedBalance === balance +- FeeRate.currencyUnit) &&
         (expectedAddresses == addresses.size) &&
         (expectedUtxos == utxos.size)
       }
@@ -73,8 +71,7 @@ class NeutrinoNodeWithWalletTest extends NodeTestWithCachedBitcoindNewest {
     //unconfirmed = 3 BTC - TestAmount - TestFees
     val condition1 = () => {
       condition(
-        expectedConfirmedAmount = 3.bitcoin,
-        expectedUnconfirmedAmount = 3.bitcoin - TestAmount - TestFees,
+        expectedBalance = 6.bitcoin - TestAmount - TestFees,
         expectedUtxos = 3,
         expectedAddresses = 7
       )
@@ -86,9 +83,7 @@ class NeutrinoNodeWithWalletTest extends NodeTestWithCachedBitcoindNewest {
     //and have 1 more address/utxo
     val condition2 = { () =>
       condition(
-        expectedConfirmedAmount = 3.bitcoin,
-        expectedUnconfirmedAmount =
-          (3.bitcoin - TestAmount - TestFees) + TestAmount,
+        expectedBalance = (6.bitcoin - TestAmount - TestFees) + TestAmount,
         expectedUtxos = 4,
         expectedAddresses = 8
       )
@@ -105,7 +100,6 @@ class NeutrinoNodeWithWalletTest extends NodeTestWithCachedBitcoindNewest {
       _ <-
         bitcoind.getNewAddress
           .flatMap(bitcoind.generateToAddress(1, _))
-      _ <- wallet.getConfirmedBalance()
       _ <- NodeTestUtil.awaitSync(node, bitcoind)
       _ <- NodeTestUtil.awaitCompactFiltersSync(node, bitcoind)
       _ <- AsyncUtil.awaitConditionF(condition1, maxTries = 100) //10 seconds
@@ -120,7 +114,7 @@ class NeutrinoNodeWithWalletTest extends NodeTestWithCachedBitcoindNewest {
       _ <- NodeTestUtil.awaitSync(node, bitcoind)
       _ <- NodeTestUtil.awaitCompactFilterHeadersSync(node, bitcoind)
       _ <- NodeTestUtil.awaitCompactFiltersSync(node, bitcoind)
-      _ <- AsyncUtil.awaitConditionF(condition2)
+      _ <- TestAsyncUtil.awaitConditionF(condition2)
       // assert we got the full tx with witness data
       txs <- wallet.listTransactions()
     } yield assert(txs.exists(_.transaction == expectedTx))
@@ -167,10 +161,12 @@ class NeutrinoNodeWithWalletTest extends NodeTestWithCachedBitcoindNewest {
 
     def condition(): Future[Boolean] = {
       for {
+        rescan <- wallet.isRescanning()
         balance <- wallet.getBalance()
         addresses <- wallet.listAddresses()
         utxos <- wallet.listUtxos()
       } yield {
+        !rescan &&
         balance == BitcoinSWalletTest.expectedDefaultAmt + TestAmount &&
         utxos.size == 4 &&
         addresses.map(_.scriptPubKey.hex).sorted == utxos
@@ -207,9 +203,78 @@ class NeutrinoNodeWithWalletTest extends NodeTestWithCachedBitcoindNewest {
       _ = assert(addresses.isEmpty)
       _ = assert(utxos.isEmpty)
 
+      rescan <- wallet.isRescanning()
+      _ = assert(!rescan)
       _ <- wallet.fullRescanNeutrinoWallet(addressBatchSize = 7)
 
       _ <- AsyncUtil.awaitConditionF(condition)
     } yield succeed
+  }
+
+  it must "receive funds while the node is offline when we restart" in {
+    param =>
+      val NeutrinoNodeFundedWalletBitcoind(node, wallet, bitcoind, _) = param
+
+      val initBalanceF = wallet.getBalance()
+      val receivedAddrF = wallet.getNewAddress()
+      val bitcoindAddrF = bitcoind.getNewAddress
+      val sendAmt = Bitcoins.one
+      //stop the node to take us offline
+      val stopF = node.stop()
+      for {
+        initBalance <- initBalanceF
+        receiveAddr <- receivedAddrF
+        bitcoindAddr <- bitcoindAddrF
+        stoppedNode <- stopF
+        //send money and generate a block to confirm the funds while we are offline
+        _ <- bitcoind.sendToAddress(receiveAddr, sendAmt)
+        //generate a block to confirm the tx
+        _ <- bitcoind.generateToAddress(1, bitcoindAddr)
+        //restart the node now that we have received funds
+        startedNode <- stoppedNode.start()
+        _ <- startedNode.sync()
+        _ <- NodeTestUtil.awaitCompactFiltersSync(node = node, rpc = bitcoind)
+        _ <- AsyncUtil.retryUntilSatisfiedF(() => {
+          for {
+            balance <- wallet.getBalance()
+          } yield {
+            balance == initBalance + sendAmt
+          }
+        })
+        balance <- wallet.getBalance()
+      } yield {
+        assert(balance > initBalance)
+      }
+  }
+
+  it must "recognize funds were spent while we were offline" in { param =>
+    //useful test for the case where we are in a DLC
+    //and the counterparty broadcasts the funding tx or a CET
+    val NeutrinoNodeFundedWalletBitcoind(node, wallet, bitcoind, _) = param
+    val initBalanceF = wallet.getBalance()
+    val bitcoindAddrF = bitcoind.getNewAddress
+    val sendAmt = Bitcoins.one
+
+    //stop the node to take us offline
+    val stopF = node.stop()
+    for {
+      initBalance <- initBalanceF
+      bitcoindAddr <- bitcoindAddrF
+      stoppedNode <- stopF
+
+      //create a transaction that spends to bitcoind with our wallet
+      tx <- wallet.sendToAddress(bitcoindAddr, sendAmt, SatoshisPerByte.one)
+      //broadcast tx
+      _ <- bitcoind.sendRawTransaction(tx)
+      _ <- bitcoind.generateToAddress(6, bitcoindAddr)
+
+      //bring node back online
+      startedNode <- stoppedNode.start()
+      _ <- startedNode.sync()
+      _ <- NodeTestUtil.awaitCompactFiltersSync(node, bitcoind)
+      balanceAfterSpend <- wallet.getBalance()
+    } yield {
+      assert(balanceAfterSpend < initBalance)
+    }
   }
 }

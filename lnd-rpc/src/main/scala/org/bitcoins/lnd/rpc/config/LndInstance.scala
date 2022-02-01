@@ -13,19 +13,10 @@ import java.nio.file._
 import scala.util.Properties
 
 sealed trait LndInstance {
-  def network: BitcoinNetwork
-  def listenBinding: URI
-  def restUri: URI
   def rpcUri: URI
-  def bitcoindAuthCredentials: PasswordBased
-  def bitcoindRpcUri: URI
-  def zmqConfig: ZmqConfig
-  def debugLevel: LogLevel
   def macaroon: String
-
-  def datadir: Path
-
-  def certFile: File
+  def certFileOpt: Option[File]
+  def certificateOpt: Option[String]
 }
 
 case class LndInstanceLocal(
@@ -39,6 +30,9 @@ case class LndInstanceLocal(
     zmqConfig: ZmqConfig,
     debugLevel: LogLevel)
     extends LndInstance {
+
+  override val certificateOpt: Option[String] = None
+  override val certFileOpt: Option[File] = Some(certFile)
 
   private var macaroonOpt: Option[String] = None
 
@@ -78,7 +72,7 @@ object LndInstanceLocal
       case _: MainNet  => "mainnet"
       case _: TestNet3 => "testnet"
       case _: RegTest  => "regtest"
-      case _: SigNet   => "simnet"
+      case _: SigNet   => "signet"
     }
   }
 
@@ -105,5 +99,29 @@ object LndInstanceLocal
 
   def fromConfig(config: LndConfig): LndInstanceLocal = {
     config.lndInstance
+  }
+}
+
+case class LndInstanceRemote(
+    rpcUri: URI,
+    macaroon: String,
+    certFileOpt: Option[File],
+    certificateOpt: Option[String])
+    extends LndInstance
+
+object LndInstanceRemote {
+
+  def apply(
+      rpcUri: URI,
+      macaroon: String,
+      certFile: File): LndInstanceRemote = {
+    LndInstanceRemote(rpcUri, macaroon, Some(certFile), None)
+  }
+
+  def apply(
+      rpcUri: URI,
+      macaroon: String,
+      certificate: String): LndInstanceRemote = {
+    LndInstanceRemote(rpcUri, macaroon, None, Some(certificate))
   }
 }

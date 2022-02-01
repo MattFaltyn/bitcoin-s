@@ -9,6 +9,7 @@ import org.bitcoins.core.protocol.tlv._
 import org.bitcoins.core.wallet.fee.SatoshisPerVirtualByte
 import org.bitcoins.core.wallet.utxo.TxoState
 import org.bitcoins.crypto._
+import org.bitcoins.dlc.wallet.internal.DLCDataManagement
 import org.bitcoins.testkit.wallet.DLCWalletUtil._
 import org.bitcoins.testkit.wallet.FundWalletUtil.FundedDLCWallet
 import org.bitcoins.testkit.wallet.{BitcoinSDualWalletTest, DLCWalletUtil}
@@ -31,7 +32,8 @@ class WalletDLCSetupTest extends BitcoinSDualWalletTest {
       offerData: DLCOffer): Future[Assertion] = {
     val walletA = fundedDLCWallets._1.wallet
     val walletB = fundedDLCWallets._2.wallet
-
+    val walletADLCManagement = DLCDataManagement(walletA.dlcWalletDAOs)
+    val walletBDLCManagement = DLCDataManagement(walletB.dlcWalletDAOs)
     for {
       offer <- walletA.createDLCOffer(
         offerData.contractInfo,
@@ -46,7 +48,7 @@ class WalletDLCSetupTest extends BitcoinSDualWalletTest {
       _ = {
         assert(find1.isDefined)
         assert(dlcA1Opt.get.state == DLCState.Offered)
-        assert(offer.oracleInfo == offerData.oracleInfo)
+        assert(offer.oracleInfos == offerData.oracleInfos)
         assert(offer.contractInfo == offerData.contractInfo)
         assert(offer.totalCollateral == offerData.totalCollateral)
         assert(offer.feeRate == offerData.feeRate)
@@ -91,17 +93,19 @@ class WalletDLCSetupTest extends BitcoinSDualWalletTest {
       walletBChange <- walletB.addressDAO.read(accept.changeAddress)
       walletBFinal <- walletB.addressDAO.read(accept.pubKeys.payoutAddress)
 
-      (announcementsA, announcementDataA, nonceDbsA) <- walletA
+      (announcementsA, announcementDataA, nonceDbsA) <- walletADLCManagement
         .getDLCAnnouncementDbs(dlcDb.dlcId)
-      announcementTLVsA = walletA.getOracleAnnouncements(announcementsA,
-                                                         announcementDataA,
-                                                         nonceDbsA)
+      announcementTLVsA = walletADLCManagement.getOracleAnnouncements(
+        announcementsA,
+        announcementDataA,
+        nonceDbsA)
 
-      (announcementsB, announcementDataB, nonceDbsB) <- walletA
+      (announcementsB, announcementDataB, nonceDbsB) <- walletADLCManagement
         .getDLCAnnouncementDbs(dlcDb.dlcId)
-      announcementTLVsB = walletB.getOracleAnnouncements(announcementsB,
-                                                         announcementDataB,
-                                                         nonceDbsB)
+      announcementTLVsB = walletBDLCManagement.getOracleAnnouncements(
+        announcementsB,
+        announcementDataB,
+        nonceDbsB)
     } yield {
       assert(dlcDb.contractIdOpt.get == sign.contractId)
 
@@ -152,7 +156,7 @@ class WalletDLCSetupTest extends BitcoinSDualWalletTest {
         ContractOraclePair.EnumPair(EnumContractDescriptor(outcomes),
                                     sampleOracleInfo)
 
-      val contractInfo: ContractInfo = ContractInfo(totalCol, oraclePair)
+      val contractInfo: ContractInfo = SingleContractInfo(totalCol, oraclePair)
 
       val offerData =
         sampleDLCOffer.copy(contractInfo = contractInfo,
@@ -209,7 +213,7 @@ class WalletDLCSetupTest extends BitcoinSDualWalletTest {
         ContractOraclePair.EnumPair(EnumContractDescriptor(outcomes),
                                     sampleOracleInfo)
 
-      val contractInfo: ContractInfo = ContractInfo(totalCol, oraclePair)
+      val contractInfo: ContractInfo = SingleContractInfo(totalCol, oraclePair)
 
       val offerData =
         sampleDLCOffer.copy(contractInfo = contractInfo,
@@ -270,7 +274,7 @@ class WalletDLCSetupTest extends BitcoinSDualWalletTest {
         _ = {
           assert(dlcA1Opt.isDefined)
           assert(dlcA1Opt.get.state == DLCState.Offered)
-          assert(offer.oracleInfo == offerData.oracleInfo)
+          assert(offer.oracleInfos == offerData.oracleInfos)
           assert(offer.contractInfo == offerData.contractInfo)
           assert(offer.totalCollateral == offerData.totalCollateral)
           assert(offer.feeRate == offerData.feeRate)
@@ -408,7 +412,7 @@ class WalletDLCSetupTest extends BitcoinSDualWalletTest {
       val walletA = FundedDLCWallets._1.wallet
       val walletB = FundedDLCWallets._2.wallet
 
-      testDLCSignVerification[NoSuchElementException](
+      testDLCSignVerification[IllegalArgumentException](
         walletA,
         walletB,
         (sign: DLCSign) =>
@@ -441,9 +445,7 @@ class WalletDLCSetupTest extends BitcoinSDualWalletTest {
         walletA,
         walletB,
         (sign: DLCSign) =>
-          sign.copy(
-            cetSigs = CETSignatures(DLCWalletUtil.dummyOutcomeSigs,
-                                    sign.cetSigs.refundSig)))
+          sign.copy(cetSigs = CETSignatures(DLCWalletUtil.dummyOutcomeSigs)))
   }
 
   it must "fail to add an invalid dlc refund sig" in {
@@ -454,10 +456,7 @@ class WalletDLCSetupTest extends BitcoinSDualWalletTest {
       testDLCSignVerification[IllegalArgumentException](
         walletA,
         walletB,
-        (sign: DLCSign) =>
-          sign.copy(
-            cetSigs = CETSignatures(sign.cetSigs.outcomeSigs,
-                                    DLCWalletUtil.dummyPartialSig)))
+        (sign: DLCSign) => sign.copy(refundSig = DLCWalletUtil.dummyPartialSig))
   }
 
   it must "fail to sign dlc with cet sigs that are invalid" in {
@@ -469,9 +468,7 @@ class WalletDLCSetupTest extends BitcoinSDualWalletTest {
         walletA,
         walletB,
         (accept: DLCAccept) =>
-          accept.copy(
-            cetSigs = CETSignatures(DLCWalletUtil.dummyOutcomeSigs,
-                                    accept.cetSigs.refundSig)))
+          accept.copy(cetSigs = CETSignatures(DLCWalletUtil.dummyOutcomeSigs)))
   }
 
   it must "fail to sign dlc with an invalid refund sig" in {
@@ -483,9 +480,7 @@ class WalletDLCSetupTest extends BitcoinSDualWalletTest {
         walletA,
         walletB,
         (accept: DLCAccept) =>
-          accept.copy(
-            cetSigs = CETSignatures(accept.cetSigs.outcomeSigs,
-                                    DLCWalletUtil.dummyPartialSig)))
+          accept.copy(refundSig = DLCWalletUtil.dummyPartialSig))
   }
 
   it must "cancel an offered DLC" in {
@@ -495,7 +490,8 @@ class WalletDLCSetupTest extends BitcoinSDualWalletTest {
       val offerData: DLCOffer = DLCWalletUtil.sampleDLCOffer
 
       val announcementTLVs =
-        offerData.contractInfo.oracleInfo.singleOracleInfos.map(_.announcement)
+        offerData.contractInfo.oracleInfos.head.singleOracleInfos
+          .map(_.announcement)
       assert(announcementTLVs.size == 1)
       val announcementTLV = announcementTLVs.head
 
@@ -709,7 +705,8 @@ class WalletDLCSetupTest extends BitcoinSDualWalletTest {
         "fdd824b4caaec7479cc9d37003f5add6504d035054ffeac8637a990305a45cfecc1062044c3f68b45318f57e41c4544a4a950c0744e2a80854349a3426b00ad86da5090b9e942dc6df2ae87f007b45b0ccd63e6c354d92c4545fc099ea3e137e54492d1efdd822500001a6a09c7c83c50b34f9db560a2e14fef2eab5224c15b18c7114331756364bfce65ffe3800fdd8062400030c44656d6f637261745f77696e0e52657075626c6963616e5f77696e056f746865720161"))
 
       val offerData = DLCOffer(
-        ContractInfo(contractDescriptor, oracleInfo),
+        DLCOfferTLV.currentVersionOpt,
+        SingleContractInfo(contractDescriptor, oracleInfo),
         dummyDLCKeys,
         Satoshis(5000),
         Vector(dummyFundingInputs.head),
@@ -735,7 +732,7 @@ class WalletDLCSetupTest extends BitcoinSDualWalletTest {
           offerData.timeouts.contractTimeout.toUInt32
         )
         _ = {
-          assert(offer.oracleInfo == offerData.oracleInfo)
+          assert(offer.oracleInfos == offerData.oracleInfos)
           assert(offer.contractInfo == offerData.contractInfo)
           assert(offer.totalCollateral == offerData.totalCollateral)
           assert(offer.feeRate == offerData.feeRate)
@@ -801,7 +798,9 @@ class WalletDLCSetupTest extends BitcoinSDualWalletTest {
                                    asInitiator = true,
                                    func = func,
                                    expectedOutputs = 1)
-      } yield assert(result)
+      } yield {
+        assert(result)
+      }
   }
 
   it must "accept 2 offers with the same oracle info" in { wallets =>

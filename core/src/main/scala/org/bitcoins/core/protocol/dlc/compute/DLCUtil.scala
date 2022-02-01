@@ -1,6 +1,13 @@
 package org.bitcoins.core.protocol.dlc.compute
 
+import org.bitcoins.core.number.UInt16
 import org.bitcoins.core.policy.Policy
+import org.bitcoins.core.protocol.dlc.build.DLCTxBuilder
+import org.bitcoins.core.protocol.dlc.models.DLCMessage.{
+  DLCAccept,
+  DLCAcceptWithoutSigs,
+  DLCOffer
+}
 import org.bitcoins.core.protocol.dlc.models.{ContractInfo, OracleOutcome}
 import org.bitcoins.core.protocol.script.P2WSHWitnessV0
 import org.bitcoins.core.protocol.transaction.{Transaction, WitnessTransaction}
@@ -11,10 +18,22 @@ import scala.util.Try
 
 object DLCUtil {
 
+  /** @see https://github.com/discreetlogcontracts/dlcspecs/blob/master/Protocol.md#definition-of-contract_id
+    * @param fundingTx the transaction that contains the DLC funding output
+    * @param outputIdx the index of the output
+    * @param tempContractId the temporary contractId in the offer message
+    * @return
+    */
   def computeContractId(
       fundingTx: Transaction,
+      outputIdx: Int,
       tempContractId: Sha256Digest): ByteVector = {
-    fundingTx.txIdBE.bytes.xor(tempContractId.bytes)
+    val u16 = UInt16(outputIdx)
+    //we need to pad the u16 due to how xor works in scodec so we don't lose precision
+    val padded = ByteVector.fill(30)(0.toByte) ++ u16.bytes
+    fundingTx.txIdBE.bytes
+      .xor(tempContractId.bytes)
+      .xor(padded)
   }
 
   /** Extracts an adaptor secret from cetSig assuming it is the completion
@@ -117,5 +136,55 @@ object DLCUtil {
 
       (SchnorrDigitalSignature(outcome.aggregateNonce, s), outcome)
     }
+  }
+
+  def calcContractId(offer: DLCOffer, accept: DLCAccept): ByteVector = {
+    calcContractId(offer, accept.withoutSigs)
+  }
+
+  def calcContractId(
+      offer: DLCOffer,
+      acceptWithoutSigs: DLCAcceptWithoutSigs): ByteVector = {
+    val fundingKeys =
+      Vector(offer.pubKeys.fundingKey, acceptWithoutSigs.pubKeys.fundingKey)
+    val fundOutputSerialId = offer.fundOutputSerialId
+    val offerFundingInputs = offer.fundingInputs
+    val acceptFundingInputs = acceptWithoutSigs.fundingInputs
+    val offerChangeSPK = offer.changeAddress.scriptPubKey
+    val acceptChangeSPK = acceptWithoutSigs.changeAddress.scriptPubKey
+    val offerFinalAddressSPK = offer.pubKeys.payoutAddress.scriptPubKey
+    val acceptFinalAddressSPK =
+      acceptWithoutSigs.pubKeys.payoutAddress.scriptPubKey
+    val feeRate = offer.feeRate
+    val (_, fundingSPK) = DLCTxBuilder.buildFundingSPKs(fundingKeys)
+
+    val fundingTxFinalizer = DLCTxBuilder.buildFundingTxFinalizer(
+      offerFundingInputs = offerFundingInputs,
+      acceptFundingInputs = acceptFundingInputs,
+      offerChangeSPK = offerChangeSPK,
+      acceptChangeSPK = acceptChangeSPK,
+      offerPayoutSPK = offerFinalAddressSPK,
+      acceptPayoutSPK = acceptFinalAddressSPK,
+      feeRate = feeRate,
+      fundingSPK = fundingSPK
+    )
+
+    val (fundingTx, fundingOutputIdx) = DLCTxBuilder.buildFundingTransaction(
+      offerInput = offer.totalCollateral,
+      acceptInput = acceptWithoutSigs.totalCollateral,
+      offerFundingInputs = offerFundingInputs,
+      acceptFundingInputs = acceptFundingInputs,
+      offerChangeSPK = offerChangeSPK,
+      offerChangeSerialId = offer.changeSerialId,
+      acceptChangeSPK = acceptChangeSPK,
+      acceptChangeSerialId = acceptWithoutSigs.changeSerialId,
+      fundingSPK = fundingSPK,
+      fundOutputSerialId = fundOutputSerialId,
+      finalizer = fundingTxFinalizer
+    )
+
+    computeContractId(fundingTx = fundingTx,
+                      outputIdx = fundingOutputIdx,
+                      tempContractId = offer.tempContractId)
   }
 }

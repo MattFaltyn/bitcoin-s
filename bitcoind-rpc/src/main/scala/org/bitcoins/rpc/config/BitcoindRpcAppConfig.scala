@@ -18,13 +18,11 @@ import scala.concurrent.Future
   * @param confs Optional sequence of configuration overrides
   */
 case class BitcoindRpcAppConfig(
-    private val directory: Path,
-    private val confs: Config*)(implicit val system: ActorSystem)
+    baseDatadir: Path,
+    configOverrides: Vector[Config])(implicit val system: ActorSystem)
     extends AppConfig {
 
   import system.dispatcher
-
-  override protected[bitcoins] def configOverrides: List[Config] = confs.toList
 
   override protected[bitcoins] def moduleName: String =
     BitcoindRpcAppConfig.moduleName
@@ -33,9 +31,7 @@ case class BitcoindRpcAppConfig(
 
   override protected[bitcoins] def newConfigOfType(
       configs: Seq[Config]): BitcoindRpcAppConfig =
-    BitcoindRpcAppConfig(directory, configs: _*)
-
-  protected[bitcoins] def baseDatadir: Path = directory
+    BitcoindRpcAppConfig(baseDatadir, configs.toVector)
 
   override def start(): Future[Unit] = Future.unit
 
@@ -51,9 +47,20 @@ case class BitcoindRpcAppConfig(
     config.getStringOrElse("bitcoin-s.bitcoind-rpc.datadir",
                            BitcoindConfig.DEFAULT_DATADIR.toString))
 
-  lazy val bind = new URI({
-    val baseUrl =
-      config.getStringOrElse("bitcoin-s.bitcoind-rpc.bind", "localhost")
+  lazy val host = new URI({
+    val baseUrl = {
+      config.getStringOrNone("bitcoin-s.bitcoind-rpc.connect") match {
+        case Some(rpcconnect) => rpcconnect
+        case None =>
+          config.getStringOrNone("bitcoin-s.bitcoind-rpc.bind") match {
+            case Some(rpcbind) =>
+              logger.warn(
+                "Config option bitcoin-s.bitcoind-rpc.bind will soon be deprecated. Use bitcoin-s.bitcoind-rpc.connect instead.")
+              rpcbind
+            case None => "localhost"
+          }
+      }
+    }
     if (baseUrl.startsWith("http")) baseUrl
     else "http://" + baseUrl
   })
@@ -61,11 +68,22 @@ case class BitcoindRpcAppConfig(
   lazy val port: Int =
     config.getIntOrElse("bitcoin-s.bitcoind-rpc.port", network.port)
 
-  lazy val uri: URI = new URI(s"$bind:$port")
+  lazy val uri: URI = new URI(s"$host:$port")
 
-  lazy val rpcBind = new URI({
-    val baseUrl =
-      config.getStringOrElse("bitcoin-s.bitcoind-rpc.rpcbind", "localhost")
+  lazy val rpcHost = new URI({
+    val baseUrl = {
+      config.getStringOrNone("bitcoin-s.bitcoind-rpc.rpcconnect") match {
+        case Some(rpcconnect) => rpcconnect
+        case None =>
+          config.getStringOrNone("bitcoin-s.bitcoind-rpc.rpcbind") match {
+            case Some(rpcbind) =>
+              logger.warn(
+                "Config option bitcoin-s.bitcoind-rpc.rpcbind will soon be deprecated. Use bitcoin-s.bitcoind-rpc.rpcconnect instead.")
+              rpcbind
+            case None => "localhost"
+          }
+      }
+    }
     if (baseUrl.startsWith("http")) baseUrl
     else "http://" + baseUrl
   })
@@ -73,7 +91,10 @@ case class BitcoindRpcAppConfig(
   lazy val rpcPort: Int =
     config.getIntOrElse("bitcoin-s.bitcoind-rpc.rpcport", network.rpcPort)
 
-  lazy val rpcUri: URI = new URI(s"$rpcBind:$rpcPort")
+  lazy val rpcUri: URI = {
+    val u = new URI(s"$rpcHost:$rpcPort")
+    u
+  }
 
   lazy val rpcUser: Option[String] =
     config.getStringOrNone("bitcoin-s.bitcoind-rpc.rpcuser")
@@ -82,7 +103,7 @@ case class BitcoindRpcAppConfig(
     config.getStringOrNone("bitcoin-s.bitcoind-rpc.rpcpassword")
 
   lazy val torConf: TorAppConfig =
-    TorAppConfig(directory, confs: _*)
+    TorAppConfig(baseDatadir, Some(moduleName), configOverrides)
 
   lazy val socks5ProxyParams: Option[Socks5ProxyParams] =
     torConf.socks5ProxyParams
@@ -93,7 +114,7 @@ case class BitcoindRpcAppConfig(
       .map(BitcoindVersion.fromString)
 
   lazy val isRemote: Boolean =
-    config.getBooleanOrElse("bitcoin-s.bitcoind-rpc.isRemote", default = false)
+    config.getBooleanOrElse("bitcoin-s.bitcoind-rpc.remote", default = false)
 
   lazy val authCredentials: BitcoindAuthCredentials = rpcUser match {
     case Some(rpcUser) => {
@@ -155,13 +176,27 @@ case class BitcoindRpcAppConfig(
                              proxyParams = socks5ProxyParams)
   }
 
-  lazy val client: BitcoindRpcClient = {
+  /** Creates a bitcoind rpc client based on the [[bitcoindInstance]] configured */
+  lazy val clientF: Future[BitcoindRpcClient] = {
     bitcoindInstance match {
       case local: BitcoindInstanceLocal =>
         val version = versionOpt.getOrElse(local.getVersion)
-        BitcoindRpcClient.fromVersion(version, bitcoindInstance)
+        val client = BitcoindRpcClient.fromVersion(version, bitcoindInstance)
+        Future.successful(client)
       case _: BitcoindInstanceRemote =>
-        new BitcoindRpcClient(bitcoindInstance)
+        //first get a generic rpc client so we can retrieve
+        //the proper version of the remote running bitcoind
+        val noVersionRpc = new BitcoindRpcClient(bitcoindInstance)
+        val versionF = noVersionRpc.version
+
+        //if we don't retrieve the proper version, we can
+        //end up with exceptions on an rpc client that actually supports
+        //specific features that are not supported across all versions of bitcoind
+        //such as blockfilters
+        //see: https://github.com/bitcoin-s/bitcoin-s/issues/3695#issuecomment-929492945
+        versionF.map { version =>
+          BitcoindRpcClient.fromVersion(version, instance = bitcoindInstance)
+        }
     }
   }
 }
@@ -177,6 +212,6 @@ object BitcoindRpcAppConfig
 
   override def fromDatadir(datadir: Path, confs: Vector[Config])(implicit
       system: ActorSystem): BitcoindRpcAppConfig =
-    BitcoindRpcAppConfig(datadir, confs: _*)
+    BitcoindRpcAppConfig(datadir, confs)
 
 }

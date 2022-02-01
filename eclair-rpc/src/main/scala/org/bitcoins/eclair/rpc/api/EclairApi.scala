@@ -8,14 +8,13 @@ import org.bitcoins.core.protocol.ln.channel.{
   ShortChannelId
 }
 import org.bitcoins.core.protocol.ln.currency.MilliSatoshis
-import org.bitcoins.core.protocol.ln.node.NodeId
+import org.bitcoins.core.protocol.ln.node.{NodeId, NodeUri}
 import org.bitcoins.core.protocol.ln.routing.{NodeRoute, Route}
 import org.bitcoins.core.protocol.ln.{LnInvoice, LnParams, PaymentPreimage}
 import org.bitcoins.core.protocol.script.ScriptPubKey
 import org.bitcoins.core.protocol.{Address, BitcoinAddress}
 import org.bitcoins.core.wallet.fee.SatoshisPerByte
 import org.bitcoins.crypto.{DoubleSha256DigestBE, Sha256Digest}
-import org.bitcoins.eclair.rpc.network.NodeUri
 
 import java.net.InetSocketAddress
 import java.time.Instant
@@ -94,12 +93,12 @@ trait EclairApi {
   def isConnected(nodeId: NodeId): Future[Boolean]
 
   def updateRelayFee(
-      channelId: ChannelId,
+      nodeId: NodeId,
       feeBaseMsat: MilliSatoshis,
       feeProportionalMillionths: Long): Future[UpdateRelayFeeResult]
 
   def updateRelayFee(
-      shortChannelId: ShortChannelId,
+      nodeIds: Vector[NodeId],
       feeBaseMsat: MilliSatoshis,
       feePropertionalMillionths: Long
   ): Future[UpdateRelayFeeResult]
@@ -245,7 +244,6 @@ trait EclairApi {
   def sendToNode(
       nodeId: NodeId,
       amountMsat: MilliSatoshis,
-      paymentHash: Sha256Digest,
       maxAttempts: Option[Int],
       feeThresholdSat: Option[Satoshis],
       maxFeePct: Option[Int],

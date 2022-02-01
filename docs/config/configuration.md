@@ -31,11 +31,11 @@ val defaultConfig = WalletAppConfig.fromDefaultDatadir()
 
 // reads a custom data directory
 val customDirectory = Paths.get(Properties.userHome, "custom-bitcoin-s-directory")
-val configFromCustomDatadir = WalletAppConfig(customDirectory)
+val configFromCustomDatadir = WalletAppConfig(customDirectory, Vector.empty)
 
 // reads a custom data directory and overrides the network to be testnet3
 val customOverride = ConfigFactory.parseString("bitcoin-s.network = testnet3")
-val configFromCustomDirAndOverride = WalletAppConfig(customDirectory, customOverride)
+val configFromCustomDirAndOverride = WalletAppConfig(customDirectory, Vector(customOverride))
 ```
 
 You can pass as many `com.typesafe.config.Config`s as you'd like. If any keys appear multiple times the last one
@@ -140,12 +140,12 @@ bitcoin-s {
         binary = ${HOME}/.bitcoin-s/binaries/bitcoind/bitcoin-0.20.1/bin/bitcoind
         # bitcoind datadir
         datadir = ${HOME}/.bitcoin
-        # bitcoind network binding
-        bind = localhost
+        # bitcoind network host
+        connect = localhost
         # bitcoind p2p port
         port = 8333
-        # bitcoind rpc binding
-        rpcbind = localhost
+        # bitcoind rpc host
+        rpcconnect = localhost
         # bitcoind rpc port
         rpcport = 8332
         # bitcoind zmq raw tx
@@ -244,6 +244,10 @@ bitcoin-s {
 
         requiredConfirmations = 6
 
+        # Expected average fee rate over the long term
+        # in satoshis per virtual byte
+        longTermFeeRate = 10
+
         # How big the address queue size is before we throw an exception
         # because of an overflow
         addressQueueSize = 10
@@ -265,6 +269,11 @@ bitcoin-s {
 
         # Password that your seed is encrypted with
         aesPassword = changeMe
+        
+        # At least 16 bytes of entropy encoded in hex
+        # This will be used as the seed for any
+        # project that is dependent on the keymanager
+        entropy = ""
     }
 
     # Bitcoin-S provides manny different fee providers
@@ -293,7 +302,15 @@ bitcoin-s {
     dlcnode {
         # The address we are listening on for incoming connections for DLCs
         # Binding to 0.0.0.0 makes us listen to all incoming connections
+        # Consider using 127.0.0.1 listen address if Tor is enabled.
         listen = "0.0.0.0:2862"
+        
+        # The address our peers use to connect to our node. 
+        # By default it's the same as the listen address, 
+        # or if Tor is enabled, the hidden service's onion address.
+        # You can specify a port number like this "192.168.0.1:12345", 
+        # The default port number is the same as in the listen adrress  
+        # external-ip = "192.168.0.1"  
     }
 
     server {
@@ -302,6 +319,15 @@ bitcoin-s {
 
         # The ip address we bind our server too
         rpcbind = "127.0.0.1"
+        
+        # The port we bind our websocket server on
+        wsport = 19999
+        
+        # The ip address we bind the websocket server too
+        wsbind = "127.0.0.1"
+        
+        # The basic auth password. It must me must be non empty.
+        password = topsecret
     }
 
     oracle {
@@ -310,6 +336,9 @@ bitcoin-s {
 
         # The ip address we bind our server too
         rpcbind = "127.0.0.1"
+
+        # The basic auth password. It must me must be non empty.
+        password = supersecret
 
         hikari-logging = true
         hikari-logging-interval = 10 minute

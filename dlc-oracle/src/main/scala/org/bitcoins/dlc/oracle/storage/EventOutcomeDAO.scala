@@ -10,7 +10,7 @@ import slick.lifted.{ForeignKeyQuery, ProvenShape}
 import scala.concurrent.{ExecutionContext, Future}
 
 case class EventOutcomeDAO()(implicit
-    val ec: ExecutionContext,
+    override val ec: ExecutionContext,
     override val appConfig: DLCOracleAppConfig)
     extends CRUD[EventOutcomeDb, (SchnorrNonce, String)]
     with SlickUtil[EventOutcomeDb, (SchnorrNonce, String)] {
@@ -46,9 +46,13 @@ case class EventOutcomeDAO()(implicit
   }
 
   def findByNonce(nonce: SchnorrNonce): Future[Vector[EventOutcomeDb]] = {
-    val query = table.filter(_.nonce === nonce)
+    findByNonces(Vector(nonce))
+  }
 
-    safeDatabase.runVec(query.result.transactionally)
+  def findByNonces(
+      nonces: Vector[SchnorrNonce]): Future[Vector[EventOutcomeDb]] = {
+    val action = table.filter(_.nonce.inSet(nonces)).result.transactionally
+    safeDatabase.runVec(action)
   }
 
   def find(

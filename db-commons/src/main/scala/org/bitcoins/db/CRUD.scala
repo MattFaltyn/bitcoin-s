@@ -16,9 +16,11 @@ import scala.concurrent.{ExecutionContext, Future}
   * the table and the database you are connecting to.
   */
 abstract class CRUD[T, PrimaryKeyType](implicit
-    private val ec: ExecutionContext,
+    override
+    val ec: ExecutionContext,
     override val appConfig: DbAppConfig)
-    extends JdbcProfileComponent[DbAppConfig] {
+    extends CRUDAction[T, PrimaryKeyType]
+    with JdbcProfileComponent[DbAppConfig] {
 
   val schemaName: Option[String] = appConfig.schemaName
 
@@ -43,9 +45,6 @@ abstract class CRUD[T, PrimaryKeyType](implicit
       tableQuery: TableQuery[SomeT]): TableQuery[SpecificT] = {
     tableQuery.asInstanceOf[TableQuery[SpecificT]]
   }
-
-  /** The table inside our database we are inserting into */
-  val table: profile.api.TableQuery[_ <: profile.api.Table[T]]
 
   /** Binding to the actual database itself, this is what is used to run querys */
   def safeDatabase: SafeDatabase = SafeDatabase(this)
@@ -76,30 +75,13 @@ abstract class CRUD[T, PrimaryKeyType](implicit
 
   /** Update the corresponding record in the database */
   def update(t: T): Future[T] = {
-    updateAll(Vector(t)).map { ts =>
-      ts.headOption match {
-        case Some(updated) => updated
-        case None          => throw UpdateFailedException("Update failed for: " + t)
-      }
-    }
+    val action = updateAction(t).transactionally
+    safeDatabase.run(action)
   }
 
   def updateAll(ts: Vector[T]): Future[Vector[T]] = {
-    if (ts.isEmpty) {
-      Future.successful(ts)
-    } else {
-      val actions = ts.map(t => find(t).update(t))
-      for {
-        numUpdated <- safeDatabase.runVec(
-          DBIO.sequence(actions).transactionally)
-        tsUpdated <- {
-          if (numUpdated.sum == ts.length) Future.successful(ts)
-          else
-            Future.failed(new RuntimeException(
-              s"Unexpected number of updates completed ${numUpdated.sum} of ${ts.length}"))
-        }
-      } yield tsUpdated
-    }
+    val actions = updateAllAction(ts).transactionally
+    safeDatabase.runVec(actions)
   }
 
   /** delete the corresponding record in the database
@@ -109,14 +91,21 @@ abstract class CRUD[T, PrimaryKeyType](implicit
     */
   def delete(t: T): Future[Int] = {
     logger.debug("Deleting record: " + t)
-    val query: Query[Table[_], T, Seq] = find(t)
-    safeDatabase.run(query.delete)
+    val action = deleteAction(t)
+    safeDatabase.run(action.transactionally)
+  }
+
+  def deleteAll(ts: Vector[T]): Future[Int] = {
+    val action = deleteAllAction(ts).transactionally
+    safeDatabase.run(action)
   }
 
   /** delete all records from the table
     */
-  def deleteAll(): Future[Int] =
-    safeDatabase.run(table.delete.transactionally)
+  def deleteAll(): Future[Int] = {
+    val action = deleteAllAction().transactionally
+    safeDatabase.run(action)
+  }
 
   /** insert the record if it does not exist, update it if it does
     *
@@ -149,30 +138,9 @@ abstract class CRUD[T, PrimaryKeyType](implicit
     }
   }
 
-  /** return all rows that have a certain primary key
-    *
-    * @param id
-    * @return Query object corresponding to the selected rows
-    */
-  protected def findByPrimaryKey(id: PrimaryKeyType): Query[Table[_], T, Seq] =
-    findByPrimaryKeys(Vector(id))
-
-  /** Finds the rows that correlate to the given primary keys */
-  protected def findByPrimaryKeys(
-      ids: Vector[PrimaryKeyType]): Query[Table[T], T, Seq]
-
-  /** return the row that corresponds with this record
-    *
-    * @param t - the row to find
-    * @return query - the sql query to find this record
-    */
-  protected def find(t: T): Query[Table[_], T, Seq] = findAll(Vector(t))
-
-  protected def findAll(ts: Vector[T]): Query[Table[_], T, Seq]
-
   /** Finds all elements in the table */
   def findAll(): Future[Vector[T]] =
-    safeDatabase.run(table.result).map(_.toVector)
+    safeDatabase.run(findAllAction())
 
   /** Returns number of rows in the table */
   def count(): Future[Int] = safeDatabase.run(table.length.result)

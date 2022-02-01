@@ -27,19 +27,18 @@ import org.bitcoins.core.script.control.OP_RETURN
 import org.bitcoins.core.util.{BitcoinScriptUtil, FutureUtil, HDUtil}
 import org.bitcoins.core.wallet.builder._
 import org.bitcoins.core.wallet.fee._
-import org.bitcoins.core.wallet.keymanagement.{
-  KeyManagerParams,
-  KeyManagerUnlockError
-}
+import org.bitcoins.core.wallet.keymanagement.KeyManagerParams
 import org.bitcoins.core.wallet.utxo.TxoState._
 import org.bitcoins.core.wallet.utxo._
 import org.bitcoins.crypto._
-import org.bitcoins.keymanager.bip39.{BIP39KeyManager, BIP39LockedKeyManager}
+import org.bitcoins.db.models.MasterXPubDAO
+import org.bitcoins.db.SafeDatabase
+import org.bitcoins.keymanager.bip39.BIP39KeyManager
 import org.bitcoins.wallet.config.WalletAppConfig
 import org.bitcoins.wallet.internal._
 import org.bitcoins.wallet.models._
 import scodec.bits.ByteVector
-
+import slick.dbio.{DBIOAction, Effect, NoStream}
 import java.time.Instant
 import scala.concurrent.{ExecutionContext, Future}
 import scala.util.{Failure, Random, Success}
@@ -54,7 +53,9 @@ abstract class Wallet
     with RescanHandling
     with WalletLogger {
 
-  override def keyManager: BIP39KeyManager
+  override def keyManager: BIP39KeyManager = {
+    walletConfig.kmConf.toBip39KeyManager
+  }
 
   implicit val ec: ExecutionContext
 
@@ -84,6 +85,7 @@ abstract class Wallet
   private[bitcoins] val stateDescriptorDAO: WalletStateDescriptorDAO =
     WalletStateDescriptorDAO()
 
+  private val safeDatabase: SafeDatabase = spendingInfoDAO.safeDatabase
   val nodeApi: NodeApi
   val chainQueryApi: ChainQueryApi
   val creationTime: Instant = keyManager.creationTime
@@ -230,29 +232,6 @@ abstract class Wallet
     }
   }
 
-  def unlock(
-      passphraseOpt: Option[AesPassword],
-      bip39PasswordOpt: Option[String]): Either[
-    KeyManagerUnlockError,
-    Wallet] = {
-    val kmParams = walletConfig.kmParams
-
-    val unlockedKeyManagerE =
-      BIP39LockedKeyManager.unlock(passphraseOpt = passphraseOpt,
-                                   bip39PasswordOpt = bip39PasswordOpt,
-                                   kmParams = kmParams)
-    unlockedKeyManagerE match {
-      case Right(km) =>
-        val w = Wallet(keyManager = km,
-                       nodeApi = nodeApi,
-                       chainQueryApi = chainQueryApi,
-                       feeRateApi = feeRateApi,
-                       creationTime = km.creationTime)
-        Right(w)
-      case Left(err) => Left(err)
-    }
-  }
-
   override def broadcastTransaction(transaction: Transaction): Future[Unit] =
     for {
       _ <- nodeApi.broadcastTransaction(transaction)
@@ -278,21 +257,25 @@ abstract class Wallet
   }
 
   override def clearAllUtxosAndAddresses(): Future[Wallet] = {
-    val resultedF = for {
-      _ <- spendingInfoDAO.deleteAll()
-      _ <- addressDAO.deleteAll()
-      _ <- scriptPubKeyDAO.deleteAll()
+    val aggregatedActions: DBIOAction[
+      Unit,
+      NoStream,
+      Effect.Write with Effect.Transactional] = for {
+      _ <- addressTagDAO.deleteAllAction()
+      _ <- spendingInfoDAO.deleteAllAction()
+      _ <- addressDAO.deleteAllAction()
+      _ <- scriptPubKeyDAO.deleteAllAction()
     } yield {
-      logger.info(
-        s"Done clearing all utxos, addresses and scripts from the database")
-      this
+      ()
     }
+
+    val resultedF = safeDatabase.run(aggregatedActions)
     resultedF.failed.foreach(err =>
       logger.error(
         s"Failed to clear utxos, addresses and scripts from the database",
         err))
 
-    resultedF
+    resultedF.map(_ => this)
   }
 
   /** Sums up the value of all unspent
@@ -325,7 +308,6 @@ abstract class Wallet
 
   override def getConfirmedBalance(): Future[CurrencyUnit] = {
     filterThenSum(_.state == ConfirmedReceived).map { balance =>
-      logger.trace(s"Confirmed balance=${balance.satoshis}")
       balance
     }
   }
@@ -338,6 +320,7 @@ abstract class Wallet
         HDAccount.isSameAccount(utxo.privKeyPath.path, account) &&
         utxo.state == ConfirmedReceived
       }
+
       confirmedUtxos.foldLeft(CurrencyUnits.zero)(_ + _.output.value)
     }
   }
@@ -363,11 +346,11 @@ abstract class Wallet
     for {
       allUnspent <- spendingInfoDAO.findAllUnspent()
     } yield {
-      val confirmedUtxos = allUnspent.filter { utxo =>
+      val unconfirmed = allUnspent.filter { utxo =>
         HDAccount.isSameAccount(utxo.privKeyPath.path, account) &&
-        utxo.state == PendingConfirmationsReceived || utxo.state == BroadcastReceived
+        (utxo.state == PendingConfirmationsReceived || utxo.state == BroadcastReceived)
       }
-      confirmedUtxos.foldLeft(CurrencyUnits.zero)(_ + _.output.value)
+      unconfirmed.foldLeft(CurrencyUnits.zero)(_ + _.output.value)
     }
   }
 
@@ -434,7 +417,7 @@ abstract class Wallet
     val utx = txBuilder.buildTx()
     val signed = RawTxSigner.sign(utx, utxoInfos, feeRate)
 
-    for {
+    val processedTxF = for {
       ourOuts <- findOurOuts(signed)
       creditingAmount = utxoInfos.foldLeft(CurrencyUnits.zero)(_ + _.amount)
       _ <- processOurTransaction(transaction = signed,
@@ -452,6 +435,12 @@ abstract class Wallet
         logger.trace(s"    $out")
       }
       signed
+    }
+
+    processedTxF.recoverWith { case _ =>
+      //if something fails, we need to unreserve the utxos associated with this tx
+      //and then propogate the failed future upwards
+      unmarkUTXOsAsReserved(signed).flatMap(_ => processedTxF)
     }
   }
 
@@ -677,7 +666,8 @@ abstract class Wallet
         feeRate = feeRate,
         fromAccount = fromAccount,
         coinSelectionAlgo = algo,
-        fromTagOpt = None)
+        fromTagOpt = None,
+        markAsReserved = true)
 
       tx <- finishSend(txBuilder, utxoInfos, amount, feeRate, newTags)
     } yield tx
@@ -692,7 +682,7 @@ abstract class Wallet
     sendWithAlgo(address,
                  amount,
                  feeRate,
-                 CoinSelectionAlgo.AccumulateLargest,
+                 CoinSelectionAlgo.LeastWaste,
                  fromAccount)
 
   override def sendToAddress(
@@ -705,7 +695,7 @@ abstract class Wallet
     sendWithAlgo(address,
                  amount,
                  feeRate,
-                 CoinSelectionAlgo.AccumulateLargest,
+                 CoinSelectionAlgo.LeastWaste,
                  fromAccount,
                  newTags)
 
@@ -758,7 +748,9 @@ abstract class Wallet
         feeRate = feeRate,
         fromAccount = fromAccount,
         coinSelectionAlgo = CoinSelectionAlgo.RandomSelection,
-        fromTagOpt = None)
+        fromTagOpt = None,
+        markAsReserved = true
+      )
       tx <- finishSend(txBuilder,
                        utxoInfos,
                        CurrencyUnits.zero,
@@ -778,7 +770,8 @@ abstract class Wallet
         destinations = outputs,
         feeRate = feeRate,
         fromAccount = fromAccount,
-        fromTagOpt = None)
+        fromTagOpt = None,
+        markAsReserved = true)
       sentAmount = outputs.foldLeft(CurrencyUnits.zero)(_ + _.value)
       tx <- finishSend(txBuilder, utxoInfos, sentAmount, feeRate, newTags)
     } yield tx
@@ -962,30 +955,59 @@ abstract class Wallet
 object Wallet extends WalletLogger {
 
   private case class WalletImpl(
-      keyManager: BIP39KeyManager,
       nodeApi: NodeApi,
       chainQueryApi: ChainQueryApi,
-      feeRateApi: FeeRateApi,
-      override val creationTime: Instant
+      feeRateApi: FeeRateApi
   )(implicit
       val walletConfig: WalletAppConfig,
       val ec: ExecutionContext
   ) extends Wallet
 
   def apply(
-      keyManager: BIP39KeyManager,
       nodeApi: NodeApi,
       chainQueryApi: ChainQueryApi,
-      feeRateApi: FeeRateApi,
-      creationTime: Instant)(implicit
+      feeRateApi: FeeRateApi)(implicit
       config: WalletAppConfig,
       ec: ExecutionContext): Wallet = {
-    WalletImpl(keyManager, nodeApi, chainQueryApi, feeRateApi, creationTime)
+    WalletImpl(nodeApi, chainQueryApi, feeRateApi)
+  }
+
+  /** Creates the master xpub for the key manager in the database
+    * @throws RuntimeException if a different master xpub key exists in the database
+    */
+  private def createMasterXPub(keyManager: BIP39KeyManager)(implicit
+      walletAppConfig: WalletAppConfig,
+      ec: ExecutionContext): Future[ExtPublicKey] = {
+    val masterXPubDAO = MasterXPubDAO()
+    val countF = masterXPubDAO.count()
+    //make sure we don't have a xpub in the db
+    countF.flatMap { count =>
+      if (count == 0) {
+        masterXPubDAO.create(keyManager.getRootXPub).map(_.toExtPublicKey)
+      } else {
+        for {
+          xpubs <- masterXPubDAO.findAll()
+        } yield {
+          if (
+            xpubs.length == 1 && xpubs.head.toExtPublicKey == keyManager.getRootXPub
+          ) {
+            xpubs.head.toExtPublicKey
+          } else {
+            throw new IllegalArgumentException(
+              s"Wallet database contains different master xpubs, got=${xpubs}")
+          }
+        }
+      }
+    }
+
   }
 
   /** Creates the level 0 account for the given HD purpose, if the root account exists do nothing */
   private def createRootAccount(wallet: Wallet, keyManager: BIP39KeyManager)(
-      implicit ec: ExecutionContext): Future[AccountDb] = {
+      implicit ec: ExecutionContext): DBIOAction[
+    AccountDb,
+    NoStream,
+    Effect.Read with Effect.Write] = {
     val coinType = HDUtil.getCoinType(keyManager.kmParams.network)
     val coin =
       HDCoin(purpose = keyManager.kmParams.purpose, coinType = coinType)
@@ -1000,65 +1022,72 @@ object Wallet extends WalletLogger {
     //2. We already have this account in our database, so we do nothing
     //3. We have this account in our database, with a DIFFERENT xpub. This is bad. Fail with an exception
     //   this most likely means that we have a different key manager than we expected
-    wallet.accountDAO.read((account.coin, account.index)).flatMap {
-      case Some(account) =>
-        if (account.xpub != xpub) {
-          val errorMsg =
-            s"Divergent xpubs for account=${account}. Existing database xpub=${account.xpub}, new xpub=${xpub}. " +
-              s"It is possible we have a different key manager being used than expected, keymanager=${keyManager.kmParams.seedPath.toAbsolutePath.toString}"
-          Future.failed(new RuntimeException(errorMsg))
-        } else {
-          logger.debug(
-            s"Account already exists in database, no need to create it, account=${account}")
-          Future.successful(account)
-        }
-      case None =>
-        wallet.accountDAO
-          .create(accountDb)
-          .map { written =>
-            logger.info(s"Created account=${accountDb} to DB")
-            written
+    wallet.accountDAO
+      .findByPrimaryKeyAction((account.coin, account.index))
+      .flatMap {
+        case Some(account) =>
+          if (account.xpub != xpub) {
+            val errorMsg =
+              s"Divergent xpubs for account=${account}. Existing database xpub=${account.xpub}, new xpub=${xpub}. " +
+                s"It is possible we have a different key manager being used than expected, keymanager=${keyManager.kmParams.seedPath.toAbsolutePath.toString}"
+            DBIOAction.failed(new RuntimeException(errorMsg))
+          } else {
+            logger.debug(
+              s"Account already exists in database, no need to create it, account=${account}")
+            DBIOAction.successful(account)
           }
-    }
-
+        case None =>
+          wallet.accountDAO
+            .createAction(accountDb)
+      }
   }
 
   def initialize(wallet: Wallet, bip39PasswordOpt: Option[String])(implicit
-      walletAppConfig: WalletAppConfig,
       ec: ExecutionContext): Future[Wallet] = {
+    implicit val walletAppConfig = wallet.walletConfig
     val passwordOpt = walletAppConfig.aesPasswordOpt
+
+    val createMasterXpubF = createMasterXPub(wallet.keyManager)
     // We want to make sure all level 0 accounts are created,
     // so the user can change the default account kind later
     // and still have their wallet work
-    def createAccountFutures: Future[Vector[Future[AccountDb]]] =
-      for {
-        _ <- walletAppConfig.start()
-        accounts = HDPurposes.singleSigPurposes.map { purpose =>
-          //we need to create key manager params for each purpose
-          //and then initialize a key manager to derive the correct xpub
-          val kmParams = wallet.keyManager.kmParams.copy(purpose = purpose)
-          val kmE = {
-            BIP39KeyManager.fromParams(kmParams = kmParams,
-                                       passwordOpt = passwordOpt,
-                                       bip39PasswordOpt = bip39PasswordOpt)
-          }
-          kmE match {
-            case Right(km) =>
-              createRootAccount(wallet = wallet, keyManager = km)
-            case Left(err) =>
-              //probably means you haven't initialized the key manager via the
-              //'CreateKeyManagerApi'
-              Future.failed(new RuntimeException(
-                s"Failed to create keymanager with params=$kmParams err=$err"))
-          }
-
+    val createAccountActions: Vector[
+      DBIOAction[AccountDb, NoStream, Effect.Read with Effect.Write]] = {
+      val accounts = HDPurposes.singleSigPurposes.map { purpose =>
+        //we need to create key manager params for each purpose
+        //and then initialize a key manager to derive the correct xpub
+        val kmParams = wallet.keyManager.kmParams.copy(purpose = purpose)
+        val kmE = {
+          BIP39KeyManager.fromParams(kmParams = kmParams,
+                                     passwordOpt = passwordOpt,
+                                     bip39PasswordOpt = bip39PasswordOpt)
         }
-      } yield accounts
+        kmE match {
+          case Right(km) =>
+            createRootAccount(wallet = wallet, keyManager = km)
+          case Left(err) =>
+            //probably means you haven't initialized the key manager via the
+            //'CreateKeyManagerApi'
+            DBIOAction.failed(
+              new RuntimeException(
+                s"Failed to create keymanager with params=$kmParams err=$err"))
+        }
 
-    createAccountFutures.flatMap(accounts => FutureUtil.collect(accounts)).map {
-      _ =>
-        logger.debug(s"Created root level accounts for wallet")
-        wallet
+      }
+      accounts
+    }
+    import wallet.accountDAO.profile.api._
+    for {
+      _ <- createMasterXpubF
+      actions = createAccountActions
+      accounts <- wallet.accountDAO.safeDatabase.runVec(
+        DBIOAction.sequence(actions).transactionally)
+      _ = accounts.foreach { a =>
+        logger.info(s"Created account=${a} to DB")
+      }
+    } yield {
+      logger.debug(s"Created root level accounts for wallet")
+      wallet
     }
   }
 }

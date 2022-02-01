@@ -1,9 +1,10 @@
 package org.bitcoins.dlc.testgen
 
-import org.bitcoins.core.number.{UInt16, UInt64}
+import org.bitcoins.core.number.UInt16
 import org.bitcoins.core.protocol.BigSizeUInt
 import org.bitcoins.core.protocol.script.EmptyScriptPubKey
 import org.bitcoins.core.protocol.tlv._
+import org.bitcoins.core.serializers.PicklerKeys
 import org.bitcoins.crypto.{CryptoUtil, NetworkElement}
 import org.bitcoins.dlc.testgen.ByteVectorWrapper._
 import play.api.libs.json._
@@ -140,20 +141,84 @@ object DLCParsingTestVector extends TestVectorParser[DLCParsingTestVector] {
 
   def apply(tlv: TLV): DLCParsingTestVector = {
     tlv match {
-      case PayoutFunctionV0TLV(points) =>
+      case old: OldPayoutFunctionV0TLV =>
+        sys.error(s"Should have old payout function here=$old")
+      case PayoutFunctionV0TLV(endpoints, pieces, _) =>
         val fields = Vector(
           "tpe" -> Element(PayoutFunctionV0TLV.tpe),
           "length" -> Element(tlv.length),
-          "numPoints" -> Element(UInt16(points.length)),
-          "points" -> MultiElement(points.map { point =>
+          "numPieces" -> Element(UInt16(pieces.length)),
+          "endpointsAndPieces" -> MultiElement(
+            endpoints
+              .zip(pieces)
+              .flatMap { case (leftEndpoint, piece) =>
+                Vector(leftEndpoint, piece)
+              }
+              .:+(endpoints.last)
+              .map {
+                case point: TLVPoint =>
+                  NamedMultiElement(
+                    "outcome" -> Element(BigSizeUInt(point.outcome)),
+                    "value" -> Element(BigSizeUInt(point.value.toLong)),
+                    "extraPrecision" -> Element(UInt16(point.extraPrecision))
+                  )
+                case piece => Element(piece)
+              })
+        )
+        DLCTLVTestVector(tlv, "payout_function_v0", fields)
+      case PolynomialPayoutCurvePieceTLV(midpoints) =>
+        val fields = Vector(
+          "tpe" -> Element(PolynomialPayoutCurvePieceTLV.tpe),
+          "length" -> Element(tlv.length),
+          "numMidpoints" -> Element(UInt16(midpoints.length)),
+          "midpoints" -> MultiElement(midpoints.map { point =>
             NamedMultiElement(
-              "isEndpoint" -> Element(ByteVector(point.leadingByte)),
               "outcome" -> Element(BigSizeUInt(point.outcome)),
-              "value" -> Element(UInt64(point.value.toLong))
+              "value" -> Element(BigSizeUInt(point.value.toLong)),
+              "extraPrecision" -> Element(UInt16(point.extraPrecision))
             )
           })
         )
-        DLCTLVTestVector(tlv, "payout_function_v0", fields)
+        DLCTLVTestVector(tlv, "polynomial_payout_curve_piece", fields)
+      case HyperbolaPayoutCurvePieceTLV(usePositivePiece,
+                                        translateOutcome,
+                                        translatePayout,
+                                        a,
+                                        b,
+                                        c,
+                                        d) =>
+        def boolToElement(bool: Boolean): Element = {
+          Element(ByteVector(if (bool) 1.toByte else 0.toByte))
+        }
+
+        val fields = Vector(
+          "tpe" -> Element(HyperbolaPayoutCurvePieceTLV.tpe),
+          "length" -> Element(tlv.length),
+          "usePositivePiece" -> boolToElement(usePositivePiece),
+          "translateOutcomeSign" -> boolToElement(translateOutcome.sign),
+          "translateOutcome" -> Element(
+            BigSizeUInt(translateOutcome.withoutPrecision)),
+          "translateOutcomeExtraPrecision" -> Element(
+            UInt16(translateOutcome.extraPrecision)),
+          "translatePayoutSign" -> boolToElement(translatePayout.sign),
+          "translatePayout" -> Element(
+            BigSizeUInt(translatePayout.withoutPrecision)),
+          "translatePayoutExtraPrecision" -> Element(
+            UInt16(translatePayout.extraPrecision)),
+          "aSign" -> boolToElement(a.sign),
+          "a" -> Element(BigSizeUInt(a.withoutPrecision)),
+          "aExtraPrecision" -> Element(UInt16(a.extraPrecision)),
+          "bSign" -> boolToElement(b.sign),
+          "b" -> Element(BigSizeUInt(b.withoutPrecision)),
+          "bExtraPrecision" -> Element(UInt16(b.extraPrecision)),
+          "cSign" -> boolToElement(c.sign),
+          "c" -> Element(BigSizeUInt(c.withoutPrecision)),
+          "cExtraPrecision" -> Element(UInt16(c.extraPrecision)),
+          "dSign" -> boolToElement(d.sign),
+          "d" -> Element(BigSizeUInt(d.withoutPrecision)),
+          "dExtraPrecision" -> Element(UInt16(d.extraPrecision))
+        )
+        DLCTLVTestVector(tlv, "hyperbola_payout_curve_piece", fields)
       case RoundingIntervalsV0TLV(intervalStarts) =>
         val fields = Vector(
           "tpe" -> Element(RoundingIntervalsV0TLV.tpe),
@@ -235,6 +300,22 @@ object DLCParsingTestVector extends TestVectorParser[DLCParsingTestVector] {
           "oracleInfo" -> Element(oracleInfo)
         )
         DLCTLVTestVector(tlv, "contract_info_v0", fields)
+      case ContractInfoV1TLV(totalCollateral, contracts) =>
+        val fields = Vector(
+          "tpe" -> Element(ContractInfoV1TLV.tpe),
+          "length" -> Element(tlv.length),
+          "totalCollateral" -> Element(totalCollateral.toUInt64),
+          "numDisjointEvents" -> Element(BigSizeUInt(contracts.length)),
+          "contracts" -> MultiElement(contracts.map {
+            case (descriptor, oracleInfo) =>
+              NamedMultiElement(
+                Vector(
+                  "contractDescriptor" -> Element(descriptor),
+                  "oracleInfo" -> Element(oracleInfo)
+                ))
+          })
+        )
+        DLCTLVTestVector(tlv, "contract_info_v1", fields)
       case FundingInputV0TLV(inputSerialId,
                              prevTx,
                              prevTxVout,
@@ -285,7 +366,8 @@ object DLCParsingTestVector extends TestVectorParser[DLCParsingTestVector] {
           })
         )
         DLCTLVTestVector(tlv, "funding_signatures_v0", fields)
-      case DLCOfferTLV(contractFlags,
+      case DLCOfferTLV(versionOpt,
+                       contractFlags,
                        chainHash,
                        contractInfo,
                        fundingPubKey,
@@ -299,7 +381,13 @@ object DLCParsingTestVector extends TestVectorParser[DLCParsingTestVector] {
                        feeRate,
                        contractMaturityBound,
                        contractTimeout) =>
-        val fields = Vector(
+        val version = versionOpt match {
+          case Some(version) =>
+            Vector(PicklerKeys.protocolVersionKey -> Element(UInt16(version)))
+          case None =>
+            Vector.empty
+        }
+        val fields = version ++ Vector(
           "tpe" -> Element(UInt16(DLCOfferTLV.tpe.toInt)),
           "contractFlags" -> Element(ByteVector(contractFlags)),
           "chainHash" -> Element(chainHash),
@@ -335,6 +423,14 @@ object DLCParsingTestVector extends TestVectorParser[DLCParsingTestVector] {
           "rounding_intervals_v0" -> Element(roundingIntervalsV0TLV)
         )
         DLCTLVTestVector(tlv, "negotiation_fields_v1", fields)
+      case NegotiationFieldsV2TLV(nestedNegotiationFields) =>
+        val fields = Vector(
+          "tpe" -> Element(NegotiationFieldsV2TLV.tpe),
+          "length" -> Element(tlv.length),
+          "nested_negotiation_fields" -> MultiElement(
+            nestedNegotiationFields.map(Element(_)))
+        )
+        DLCTLVTestVector(tlv, "negotiation_fields_v2", fields)
       case DLCAcceptTLV(tempContractId,
                         totalCollateralSatoshis,
                         fundingPubKey,

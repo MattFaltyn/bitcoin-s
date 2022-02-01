@@ -8,7 +8,7 @@ import org.bitcoins.core.gcs.BlockFilter
 import org.bitcoins.core.p2p._
 import org.bitcoins.crypto.DoubleSha256DigestBE
 import org.bitcoins.node.config.NodeAppConfig
-import org.bitcoins.node.models.BroadcastAbleTransactionDAO
+import org.bitcoins.node.models._
 import org.bitcoins.node.{Node, P2PLogger}
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
@@ -50,8 +50,9 @@ case class DataMessageHandler(
       peerMsgSender: PeerMessageSender,
       node: Node): Future[DataMessageHandler] = {
 
-    lazy val peerWithCompactFilters = node.randomPeerMsgSenderWithCompactFilters
-    lazy val randomPeer = node.randomPeerMsgSender
+    lazy val peerWithCompactFilters =
+      node.peerManager.randomPeerMsgSenderWithCompactFilters
+    lazy val randomPeer = node.peerManager.randomPeerMsgSender
 
     val resultF = payload match {
       case checkpoint: CompactFilterCheckPointMessage =>
@@ -65,7 +66,7 @@ case class DataMessageHandler(
           this.copy(chainApi = newChainApi)
         }
       case filterHeader: CompactFilterHeadersMessage =>
-        logger.info(
+        logger.debug(
           s"Got ${filterHeader.filterHashes.size} compact filter header hashes")
         val filterHeaders = filterHeader.filterHeaders
         for {
@@ -74,7 +75,7 @@ case class DataMessageHandler(
             filterHeader.stopHash.flip)
           newSyncing <-
             if (filterHeaders.size == chainConfig.filterHeaderBatchSize) {
-              logger.info(
+              logger.debug(
                 s"Received maximum amount of filter headers in one header message. This means we are not synced, requesting more")
               sendNextGetCompactFilterHeadersCommand(
                 peerWithCompactFilters,
@@ -171,19 +172,26 @@ case class DataMessageHandler(
         getData.inventories.foreach { inv =>
           logger.debug(s"Looking for inv=$inv")
           inv.typeIdentifier match {
-            case TypeIdentifier.MsgTx =>
-              txDAO.findByHash(inv.hash).map {
-                case Some(tx) =>
-                  peerMsgSender.sendTransactionMessage(tx.transaction)
+            case msgTx @ (TypeIdentifier.MsgTx | TypeIdentifier.MsgWitnessTx) =>
+              txDAO.findByHash(inv.hash).flatMap {
+                case Some(BroadcastAbleTransaction(tx)) =>
+                  val txToBroadcast =
+                    if (msgTx == TypeIdentifier.MsgTx) {
+                      // send non-witness serialization
+                      tx.toBaseTx
+                    } else tx // send normal serialization
+
+                  peerMsgSender.sendTransactionMessage(txToBroadcast)
                 case None =>
                   logger.warn(
                     s"Got request to send data with hash=${inv.hash}, but found nothing")
+                  Future.unit
               }
             case other @ (TypeIdentifier.MsgBlock |
                 TypeIdentifier.MsgFilteredBlock |
                 TypeIdentifier.MsgCompactBlock |
                 TypeIdentifier.MsgFilteredWitnessBlock |
-                TypeIdentifier.MsgWitnessBlock | TypeIdentifier.MsgWitnessTx) =>
+                TypeIdentifier.MsgWitnessBlock) =>
               logger.warn(
                 s"Got request to send data type=$other, this is not implemented yet")
 
@@ -395,6 +403,8 @@ case class DataMessageHandler(
           case NodeType.BitcoindBackend =>
             throw new RuntimeException("This is impossible")
         }
+      case Inventory(TypeIdentifier.MsgTx, hash) =>
+        Some(Inventory(TypeIdentifier.MsgWitnessTx, hash))
       case other: Inventory => Some(other)
     })
     peerMsgSender.sendMsg(getData).map(_ => this)

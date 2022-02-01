@@ -455,6 +455,8 @@ object TransactionMessage extends Factory[TransactionMessage] {
   */
 sealed trait ControlPayload extends NetworkPayload
 
+sealed trait GossipAddrMessage extends ControlPayload
+
 /** The addr (IP address) message relays connection information for peers on the network.
   * Each peer which wants to accept incoming connections creates an addr message providing its
   * connection information and then sends that message to its peers unsolicited.
@@ -463,7 +465,7 @@ sealed trait ControlPayload extends NetworkPayload
   * any program already on the network.
   * @see [[https://bitcoin.org/en/developer-reference#addr]]
   */
-trait AddrMessage extends ControlPayload {
+trait AddrMessage extends GossipAddrMessage {
   def ipCount: CompactSizeUInt
   def addresses: Seq[NetworkIpAddress]
   override def commandName = NetworkPayload.addrCommandName
@@ -500,7 +502,7 @@ object AddrMessage extends Factory[AddrMessage] {
   *
   * @see https://github.com/bitcoin/bips/blob/master/bip-0155.mediawiki
   */
-sealed trait AddrV2Message extends ControlPayload {
+sealed trait AddrV2Message extends GossipAddrMessage {
   def time: UInt32
   def services: CompactSizeUInt
   def networkId: Byte
@@ -1412,9 +1414,9 @@ object VersionMessage extends Factory[VersionMessage] {
     val nonce = UInt64.zero
     VersionMessage(
       version = ProtocolVersion.default,
-      services = ServiceIdentifier.NODE_NONE,
+      services = ServiceIdentifier.NODE_WITNESS,
       timestamp = Int64(java.time.Instant.now.getEpochSecond),
-      addressReceiveServices = ServiceIdentifier.NODE_NONE,
+      addressReceiveServices = ServiceIdentifier.NODE_WITNESS,
       addressReceiveIpAddress = receivingIpAddress,
       addressReceivePort = network.port,
       addressTransServices = ServiceIdentifier.NODE_NETWORK,

@@ -4,12 +4,15 @@ import akka.NotUsed
 import akka.actor.ActorSystem
 import akka.stream.scaladsl.{Keep, Sink, Source}
 import org.bitcoins.core.protocol.blockchain.Block
-import org.bitcoins.core.protocol.transaction.WitnessTransaction
+import org.bitcoins.core.protocol.script._
+import org.bitcoins.core.protocol.transaction.{Transaction, WitnessTransaction}
+import org.bitcoins.crypto.DoubleSha256DigestBE
 import org.bitcoins.rpc.client.common.BitcoindRpcClient
 import org.bitcoins.rpc.config.BitcoindRpcAppConfig
 import org.bitcoins.server.routes.BitcoinSRunner
 import org.bitcoins.server.util.BitcoinSAppScalaDaemon
 
+import java.time.Instant
 import scala.concurrent.Future
 
 /** Useful script for scanning bitcoind
@@ -24,17 +27,20 @@ class ScanBitcoind()(implicit
 
   override def start(): Future[Unit] = {
 
-    val bitcoind = rpcAppConfig.client
+    val bitcoindF = rpcAppConfig.clientF
 
-    val startHeight = 675000
-    val endHeightF: Future[Int] = bitcoind.getBlockCount
+    //    val startHeight = 675000
+    val endHeightF: Future[Int] = bitcoindF.flatMap(_.getBlockCount)
 
-    for {
+    val f = for {
+      bitcoind <- bitcoindF
       endHeight <- endHeightF
-      _ <- countSegwitTxs(bitcoind, startHeight, endHeight)
-    } yield {
-      sys.exit(0)
-    }
+      //_ <- countWitV1MempoolTxs(bitcoind)
+      _ <- countTaprootTxsInBlocks(endHeight, 10000, bitcoind)
+    } yield ()
+    f.failed.foreach(err =>
+      logger.error(s"Failed to count witness v1 mempool txs", err))
+    Future.unit
   }
 
   override def stop(): Future[Unit] = {
@@ -48,8 +54,8 @@ class ScanBitcoind()(implicit
       bitcoind: BitcoindRpcClient,
       source: Source[Int, NotUsed],
       f: Block => T,
-      numParallelism: Int =
-        Runtime.getRuntime.availableProcessors() * 2): Future[Seq[T]] = {
+      numParallelism: Int = Runtime.getRuntime.availableProcessors()): Future[
+    Seq[T]] = {
     source
       .mapAsync(parallelism = numParallelism) { height =>
         bitcoind
@@ -88,9 +94,68 @@ class ScanBitcoind()(implicit
     for {
       count <- countF
       endTime = System.currentTimeMillis()
-      _ = println(
+      _ = logger.info(
         s"Count of segwit txs from height=${startHeight} to endHeight=${endHeight} is ${count}. It took ${endTime - startTime}ms ")
     } yield ()
+  }
+
+  def countTaprootTxsInBlocks(
+      endHeight: Int,
+      lastBlocks: Int,
+      bitcoind: BitcoindRpcClient): Future[Int] = {
+    val startTime = System.currentTimeMillis()
+    val startHeight = endHeight - lastBlocks
+    val source: Source[Int, NotUsed] = Source(startHeight.to(endHeight))
+    val countTaprootOutputs: Block => Int = { block =>
+      val outputs = block.transactions
+        .flatMap(_.outputs)
+        .filter(_.scriptPubKey.isInstanceOf[WitnessScriptPubKeyV1])
+      outputs.length
+    }
+
+    val countsF: Future[Seq[Int]] = for {
+      counts <- searchBlocks[Int](bitcoind, source, countTaprootOutputs)
+    } yield counts
+
+    val countF: Future[Int] = countsF.map(_.sum)
+
+    for {
+      count <- countF
+      endTime = System.currentTimeMillis()
+      _ = logger.info(
+        s"Count of taproot outputs from height=${startHeight} to endHeight=${endHeight} is ${count}. It took ${endTime - startTime}ms ")
+    } yield count
+  }
+
+  def countWitV1MempoolTxs(bitcoind: BitcoindRpcClient): Future[Int] = {
+    val memPoolSourceF = getMemPoolSource(bitcoind)
+    val countF = memPoolSourceF.flatMap(_.runFold(0) { case (count, tx) =>
+      count + tx.outputs.count(
+        _.scriptPubKey.isInstanceOf[WitnessScriptPubKeyV1])
+    })
+    countF.foreach(c =>
+      logger.info(
+        s"Found $c mempool transactions with witness v1 outputs at ${Instant.now}"))
+    countF
+  }
+
+  def getMemPoolSource(
+      bitcoind: BitcoindRpcClient): Future[Source[Transaction, NotUsed]] = {
+    val mempoolF = bitcoind.getRawMemPool
+    val sourceF: Future[Source[DoubleSha256DigestBE, NotUsed]] =
+      mempoolF.map(Source(_))
+
+    val mempoolTxSourceF: Future[Source[Transaction, NotUsed]] = {
+      sourceF.map { source =>
+        source.mapAsync(Runtime.getRuntime.availableProcessors()) { hash =>
+          bitcoind
+            .getRawTransaction(hash)
+            .map(_.hex)
+        }
+      }
+    }
+
+    mempoolTxSourceF
   }
 }
 

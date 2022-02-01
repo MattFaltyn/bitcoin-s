@@ -9,10 +9,13 @@ import org.bitcoins.core.currency.CurrencyUnit
 import org.bitcoins.core.hd.HDAccount
 import org.bitcoins.core.protocol.BitcoinAddress
 import org.bitcoins.core.protocol.transaction.TransactionOutput
-import org.bitcoins.crypto.DoubleSha256DigestBE
 import org.bitcoins.dlc.wallet.DLCWallet
 import org.bitcoins.rpc.client.common.BitcoindRpcClient
 import org.bitcoins.server.{BitcoinSAppConfig, BitcoindRpcBackendUtil}
+import org.bitcoins.testkit.wallet.BitcoinSWalletTest.{
+  account1Amt,
+  defaultAcctAmts
+}
 import org.bitcoins.testkit.wallet.FundWalletUtil.{
   FundedTestWallet,
   FundedWallet
@@ -24,6 +27,35 @@ import org.bitcoins.wallet.config.WalletAppConfig
 import scala.concurrent.{ExecutionContext, Future}
 
 trait FundWalletUtil extends Logging {
+
+  /** Funds the given wallet with money from the given bitcoind */
+  def fundWalletWithBitcoind[T <: WalletWithBitcoind](pair: T)(implicit
+      ec: ExecutionContext): Future[T] = {
+    val (wallet, bitcoind) = (pair.wallet, pair.bitcoind)
+
+    val defaultAccount = wallet.walletConfig.defaultAccount
+    val fundedDefaultAccountWalletF =
+      FundWalletUtil.fundAccountForWalletWithBitcoind(
+        amts = defaultAcctAmts,
+        account = defaultAccount,
+        wallet = wallet,
+        bitcoind = bitcoind
+      )
+
+    val hdAccount1 = WalletTestUtil.getHdAccount1(wallet.walletConfig)
+    val fundedAccount1WalletF = for {
+      fundedDefaultAcct <- fundedDefaultAccountWalletF
+
+      fundedAcct1 <- FundWalletUtil.fundAccountForWalletWithBitcoind(
+        amts = account1Amt,
+        account = hdAccount1,
+        wallet = fundedDefaultAcct,
+        bitcoind = bitcoind
+      )
+    } yield fundedAcct1
+
+    fundedAccount1WalletF.map(_ => pair)
+  }
 
   def fundAccountForWallet(
       amts: Vector[CurrencyUnit],
@@ -48,8 +80,7 @@ trait FundWalletUtil extends Logging {
     }
 
     val fundedWalletF =
-      txsF.flatMap(txs =>
-        wallet.processTransactions(txs, Some(DoubleSha256DigestBE.empty)))
+      txsF.flatMap(txs => wallet.processTransactions(txs, None))
 
     fundedWalletF.map(_.asInstanceOf[Wallet])
   }
@@ -183,7 +214,9 @@ object FundWalletUtil extends FundWalletUtil {
         bip39PasswordOpt = bip39PasswordOpt,
         extraConfig = extraConfig)
       funded <- FundWalletUtil.fundWallet(wallet)
-    } yield FundedDLCWallet(funded.wallet.asInstanceOf[DLCWallet])
+    } yield {
+      FundedDLCWallet(funded.wallet.asInstanceOf[DLCWallet])
+    }
   }
 
   def createFundedDLCWalletWithBitcoind(
@@ -202,7 +235,8 @@ object FundWalletUtil extends FundWalletUtil {
 
       wallet = BitcoindRpcBackendUtil.createDLCWalletWithBitcoindCallbacks(
         bitcoind,
-        tmp)
+        tmp,
+        None)(system)
 
       funded1 <- fundAccountForWalletWithBitcoind(
         BitcoinSWalletTest.defaultAcctAmts,

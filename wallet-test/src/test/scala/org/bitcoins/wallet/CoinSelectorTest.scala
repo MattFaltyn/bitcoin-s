@@ -9,11 +9,7 @@ import org.bitcoins.core.wallet.fee.{FeeUnit, SatoshisPerByte}
 import org.bitcoins.core.wallet.utxo.TxoState
 import org.bitcoins.testkit.wallet.{BitcoinSWalletTest, WalletTestUtil}
 import org.bitcoins.testkitcore.Implicits._
-import org.bitcoins.testkitcore.gen.{
-  CryptoGenerators,
-  TransactionGenerators,
-  WitnessGenerators
-}
+import org.bitcoins.testkitcore.gen.{TransactionGenerators, WitnessGenerators}
 import org.scalatest.FutureOutcome
 
 class CoinSelectorTest extends BitcoinSWalletTest {
@@ -33,31 +29,35 @@ class CoinSelectorTest extends BitcoinSWalletTest {
     val output = TransactionOutput(99.sats, ScriptPubKey.empty)
     val feeRate = SatoshisPerByte(CurrencyUnits.zero)
 
+    val outpoint1 = TransactionGenerators.outPoint.sampleSome
     val utxo1 = SegwitV0SpendingInfo(
-      txid = CryptoGenerators.doubleSha256Digest.sampleSome.flip,
+      txid = outpoint1.txIdBE,
       state = TxoState.DoesNotExist,
       id = Some(1),
-      outPoint = TransactionGenerators.outPoint.sampleSome,
+      outPoint = outpoint1,
       output = TransactionOutput(10.sats, ScriptPubKey.empty),
       privKeyPath = WalletTestUtil.sampleSegwitPath,
       scriptWitness = WitnessGenerators.scriptWitness.sampleSome,
       spendingTxIdOpt = None
     )
+    val outPoint2 = TransactionGenerators.outPoint.sampleSome
     val utxo2 = SegwitV0SpendingInfo(
-      txid = CryptoGenerators.doubleSha256Digest.sampleSome.flip,
+      txid = outPoint2.txIdBE,
       state = TxoState.DoesNotExist,
       id = Some(2),
-      outPoint = TransactionGenerators.outPoint.sampleSome,
+      outPoint = outPoint2,
       output = TransactionOutput(90.sats, ScriptPubKey.empty),
       privKeyPath = WalletTestUtil.sampleSegwitPath,
       scriptWitness = WitnessGenerators.scriptWitness.sampleSome,
       spendingTxIdOpt = None
     )
+
+    val outPoint3 = TransactionGenerators.outPoint.sampleSome
     val utxo3 = SegwitV0SpendingInfo(
-      txid = CryptoGenerators.doubleSha256Digest.sampleSome.flip,
+      txid = outPoint3.txIdBE,
       state = TxoState.DoesNotExist,
       id = Some(3),
-      outPoint = TransactionGenerators.outPoint.sampleSome,
+      outPoint = outPoint3,
       output = TransactionOutput(20.sats, ScriptPubKey.empty),
       privKeyPath = WalletTestUtil.sampleSegwitPath,
       scriptWitness = WitnessGenerators.scriptWitness.sampleSome,
@@ -107,6 +107,22 @@ class CoinSelectorTest extends BitcoinSWalletTest {
 
     // it should not get the same thing every time
     assert(selections.exists(_ != first))
+  }
+
+  it must "select the least wasteful outputs" in { fixture =>
+    val selection =
+      CoinSelector.selectByLeastWaste(walletUtxos = fixture.utxoSet,
+                                      outputs = Vector(fixture.output),
+                                      feeRate = fixture.feeRate,
+                                      longTermFeeRate =
+                                        SatoshisPerByte.fromLong(10))
+
+    // Need to sort as ordering will be different sometimes
+    val sortedSelection = selection.sortBy(_.outPoint.hex)
+    val sortedExpected =
+      Vector(fixture.utxo2, fixture.utxo1, fixture.utxo3).sortBy(_.outPoint.hex)
+
+    assert(sortedSelection == sortedExpected)
   }
 
   it must "correctly approximate transaction input size" in { fixture =>

@@ -96,13 +96,7 @@ git clone --depth 500 --recursive https://github.com/bitcoin-s/bitcoin-s.git
 To run the entire test suite, you need to download all bitcoind instances and eclair instances. This is needed for unit tests
 or binding bitcoin-s to a bitcoind instance if you do not have locally running instances.
 
-```bashrc
-sbt downloadBitcoind
-sbt downloadEclair
-```
-
-If you want to run the entire test suite you can run the following command after you download bitcoind
-and eclair.
+If you want to run the entire test suite you can run the following command.
 
 ```bashrc
 sbt test
@@ -144,9 +138,8 @@ Testnet:
 `bitcoin-s.node.peers = ["neutrino.testnet3.suredbits.com:18333"]`
 
 If you would like to use your own node you can either use the bitcoind backend option or connect to your own compatible node.
-There is no released version of bitcoind that is neutrino compatible, so you will either have to compile the latest `master` yourself, or use the experimental version provided by running `sbt downloadBitcoind`. 
 
-After building your bitcoin-s server, properly configuring it to be in `neutrino` mode you can start your server with:
+After building your bitcoin-s server and properly configuring it to be in `neutrino` mode you can start your server with:
 
 ```bashrc
 ./app/server/target/universal/stage/bin/bitcoin-s-server
@@ -195,12 +188,12 @@ bitcoin-s {
         binary = ${HOME}/.bitcoin-s/binaries/bitcoind/bitcoin-0.20.1/bin/bitcoind
         # bitcoind datadir
         datadir = ${HOME}/.bitcoin
-        # bitcoind network binding
-        bind = localhost
+        # bitcoind network host
+        connect = localhost
         # bitcoind p2p port
         port = 8333
-        # bitcoind rpc binding
-        rpcbind = localhost
+        # bitcoind rpc host
+        rpcconnect = localhost
         # bitcoind rpc port
         rpcport = 8332
     }
@@ -212,16 +205,18 @@ bitcoin-s {
 ## Step 6 (Optional): Moving To Testnet
 
 To run your Bitcoin-S Server on testnet, simply change `network = testnet3` and change
-your `peers = ["neutrino.testnet3.suredbits.com:18333"] ` in your `.bitcoin-s/bitcoin-s.conf` file.
+your `bitcoin-s.node.peers = ["neutrino.testnet3.suredbits.com:18333"] ` in your `$HOME/.bitcoin-s/bitcoin-s.conf` file.
 This will allow you to connect to Suredbits' neutrino-enabled `bitcoind` node.
 Keep in mind then when you restart your server, it will begin initial sync which will take
 many hours as all block filters for all testnet blocks will be downloaded.
 If you wish to speed this process up,
 download [this snapshot](https://s3-us-west-2.amazonaws.com/www.suredbits.com/chaindb-testnet-2021-02-03.zip), unzip it and put the file in your `$HOME/.bitcoin-s/testnet3` directory and then from there, run
 
+This will start syncing your testnet node from block header ~1,900,000 rather than starting from zero.
+
 ```bashrc
 $ unzip chaindb-testnet-2021-02-03.zip
-$ mv chaindb.sqlite ~/.bitcoin-s/testnet/
+$ mv chaindb.sqlite ~/.bitcoin-s/testnet3/
 ```
 
 This should take a couple minutes to execute, but once it is done, you will only have a short while left to sync once you start your server.

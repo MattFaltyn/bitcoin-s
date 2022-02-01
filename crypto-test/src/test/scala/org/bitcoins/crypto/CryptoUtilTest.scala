@@ -220,4 +220,30 @@ class CryptoUtilTest extends BitcoinSCryptoTest {
       })
     }
   }
+
+  it must "do basic sanity checks on entropy" in {
+    assert(!CryptoUtil.checkEntropy(BitVector.empty))
+    val sameBytes1 = ByteVector.fill(32)(0x0)
+    val sameBytes2 = ByteVector.fill(32)(0xff)
+    assert(!CryptoUtil.checkEntropy(sameBytes1.toBitVector))
+    assert(!CryptoUtil.checkEntropy(sameBytes2.toBitVector))
+
+    //to short of entropy
+    val toShort = ByteVector.fromValidHex("0123456789abcdef")
+    assert(!CryptoUtil.checkEntropy(toShort.toBitVector))
+  }
+
+  it must "always pass our basic sanity tests for entropy with our real PRNG" in {
+    forAll(Gen.const(CryptoUtil.randomBytes(32))) { bytes =>
+      assert(CryptoUtil.checkEntropy(bytes))
+    }
+  }
+
+  it must "perform a SHA3-256 hash" in {
+    val hash = CryptoUtil.sha3_256(hex"")
+    val expected =
+      "a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a"
+    hash.hex must be(expected)
+    hash.flip.flip.hex must be(expected)
+  }
 }

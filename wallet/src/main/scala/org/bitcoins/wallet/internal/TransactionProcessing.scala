@@ -52,6 +52,7 @@ private[bitcoins] trait TransactionProcessing extends WalletLogger {
     logger.info(s"Processing block=${block.blockHeader.hash.flip.hex}")
     val start = TimeUtil.currentEpochMs
     val isEmptyF = isEmpty()
+    val heightF = chainQueryApi.getBlockHeight(block.blockHeader.hashBE)
     val resF = for {
       isEmpty <- isEmptyF
       newWallet <- {
@@ -68,11 +69,13 @@ private[bitcoins] trait TransactionProcessing extends WalletLogger {
 
     val f = for {
       res <- resF
-
       hash = block.blockHeader.hashBE
-      height <- chainQueryApi.getBlockHeight(hash)
+      height <- heightF
       _ <- stateDescriptorDAO.updateSyncHeight(hash, height.get)
-    } yield res
+      _ <- walletConfig.walletCallbacks.executeOnBlockProcessed(logger, block)
+    } yield {
+      res
+    }
 
     f.onComplete(failure =>
       signalBlockProcessingCompletion(block.blockHeader.hash, failure))
@@ -96,56 +99,75 @@ private[bitcoins] trait TransactionProcessing extends WalletLogger {
   private def processBlockCachedUtxos(block: Block): Future[Wallet] = {
     //fetch all received spending info dbs relevant to txs in this block to improve performance
     val receivedSpendingInfoDbsF =
-      spendingInfoDAO.findTxs(block.transactions.toVector)
+      spendingInfoDAO
+        .findTxs(block.transactions.toVector)
 
-    val cachedReceivedF = receivedSpendingInfoDbsF
+    val cachedReceivedOptF = receivedSpendingInfoDbsF
+      .map(Some(_)) //reduce allocations by creating Some here
 
     //fetch all spending infoDbs for this block to improve performance
     val spentSpendingInfoDbsF =
       spendingInfoDAO.findOutputsBeingSpent(block.transactions.toVector)
 
-    //we need to keep a cache of spentSpendingInfoDb
-    //for the case where we receive & then spend that
-    //same utxo in the same block
-    var cachedSpentF = spentSpendingInfoDbsF
-
-    val wallet = {
-      block.transactions.foldLeft(Future.successful(this)) {
-        (acc, transaction) =>
-          for {
-            _ <- acc
-            receivedSpendingInfoDbs <- cachedReceivedF
-            spentSpendingInfo <- cachedSpentF
-            processTxResult <- {
-              processTransactionImpl(
-                transaction = transaction,
-                blockHashOpt = Some(block.blockHeader.hash.flip),
-                newTags = Vector.empty,
-                receivedSpendingInfoDbsOpt = Some(receivedSpendingInfoDbs),
-                spentSpendingInfoDbsOpt = Some(spentSpendingInfo)
-              )
-            }
-            _ = {
-              //need to look if a received utxo is spent in the same block
-              //if so, we need to update our cachedSpentF
-              val spentInSameBlock: Vector[SpendingInfoDb] = {
-                processTxResult.updatedIncoming.filter { spendingInfoDb =>
-                  block.transactions.exists(
-                    _.inputs.exists(
-                      _.previousOutput == spendingInfoDb.outPoint))
-                }
-              }
-
-              //add it to the cache
-              cachedSpentF =
-                Future.successful(spentSpendingInfo ++ spentInSameBlock)
-            }
-          } yield {
-            this
-          }
+    val blockHashOpt = Some(block.blockHeader.hash.flip)
+    val resultF: Future[Future[Wallet]] = for {
+      //map on these first so we don't have to call
+      //.map everytime we iterate through a tx
+      //which is costly (thread overhead)
+      receivedSpendingInfoDbsOpt <- cachedReceivedOptF
+      spentSpendingInfoDbs <- spentSpendingInfoDbsF
+    } yield {
+      //we need to keep a cache of spentSpendingInfoDb
+      //for the case where we receive & then spend that
+      //same utxo in the same block
+      var cachedSpentOpt: Option[Vector[SpendingInfoDb]] = {
+        Some(spentSpendingInfoDbs)
       }
+      val blockInputs = block.transactions.flatMap(_.inputs)
+      val wallet: Future[Wallet] = {
+        block.transactions.foldLeft(Future.successful(this)) {
+          (walletF, transaction) =>
+            for {
+              wallet <- walletF
+              processTxResult <- {
+                wallet.processTransactionImpl(
+                  transaction = transaction,
+                  blockHashOpt = blockHashOpt,
+                  newTags = Vector.empty,
+                  receivedSpendingInfoDbsOpt = receivedSpendingInfoDbsOpt,
+                  spentSpendingInfoDbsOpt = cachedSpentOpt
+                )
+              }
+              _ = {
+                //need to look if a received utxo is spent in the same block
+                //if so, we need to update our cachedSpentF
+                val spentInSameBlock: Vector[SpendingInfoDb] = {
+                  processTxResult.updatedIncoming.filter { spendingInfoDb =>
+                    blockInputs.exists(
+                      _.previousOutput == spendingInfoDb.outPoint)
+                  }
+                }
+
+                //add it to the cache
+                val newCachedSpentOpt = {
+                  cachedSpentOpt match {
+                    case Some(spentSpendingInfo) =>
+                      Some(spentSpendingInfo ++ spentInSameBlock)
+                    case None =>
+                      Some(spentInSameBlock)
+                  }
+                }
+                cachedSpentOpt = newCachedSpentOpt
+              }
+            } yield {
+              this
+            }
+        }
+      }
+      wallet
     }
-    wallet
+
+    resultF.flatten
   }
 
   override def findTransaction(
@@ -303,7 +325,9 @@ private[bitcoins] trait TransactionProcessing extends WalletLogger {
         .flatten
       processed <- spendingInfoDAO.updateAllSpendingInfoDb(toBeUpdated)
       _ <- updateUtxoConfirmedStates(processed)
-    } yield processed
+    } yield {
+      processed
+    }
   }
 
   /** Does the grunt work of processing a TX.
@@ -311,7 +335,7 @@ private[bitcoins] trait TransactionProcessing extends WalletLogger {
     * processing method, which logs and transforms the
     * output fittingly.
     */
-  private def processTransactionImpl(
+  private[internal] def processTransactionImpl(
       transaction: Transaction,
       blockHashOpt: Option[DoubleSha256DigestBE],
       newTags: Vector[AddressTag],
@@ -351,16 +375,31 @@ private[bitcoins] trait TransactionProcessing extends WalletLogger {
 
     for {
       receivedSpendingInfoDbs <- receivedSpendingInfoDbsF
+      receivedStart = TimeUtil.currentEpochMs
       incoming <- processReceivedUtxos(transaction = transaction,
                                        blockHashOpt = blockHashOpt,
                                        spendingInfoDbs =
                                          receivedSpendingInfoDbs,
                                        newTags = newTags)
+      _ = if (incoming.nonEmpty) {
+        logger.info(
+          s"Finished processing ${incoming.length} received outputs, it took=${TimeUtil.currentEpochMs - receivedStart}ms")
+      }
+
       spentSpendingInfoDbs <- spentSpendingInfoDbsF
+      spentStart = TimeUtil.currentEpochMs
       outgoing <- processSpentUtxos(transaction = transaction,
                                     outputsBeingSpent = spentSpendingInfoDbs,
                                     blockHashOpt = blockHashOpt)
-      _ <- walletCallbacks.executeOnTransactionProcessed(logger, transaction)
+      _ = if (outgoing.nonEmpty) {
+        logger.info(
+          s"Finished processing ${outgoing.length} spent outputs, it took=${TimeUtil.currentEpochMs - spentStart}ms")
+      }
+      _ <-
+        // only notify about our transactions
+        if (incoming.nonEmpty || outgoing.nonEmpty)
+          walletCallbacks.executeOnTransactionProcessed(logger, transaction)
+        else Future.unit
     } yield {
       ProcessTxResult(incoming, outgoing)
     }
@@ -389,7 +428,6 @@ private[bitcoins] trait TransactionProcessing extends WalletLogger {
           out
             .copyWithSpendingTxId(spendingTxId)
             .copyWithState(state = BroadcastSpent)
-
         Some(updated)
       case TxoState.BroadcastSpent =>
         if (!out.spendingTxIdOpt.contains(spendingTxId)) {
@@ -464,31 +502,18 @@ private[bitcoins] trait TransactionProcessing extends WalletLogger {
           logger.debug(
             s"Updating block_hash of txo=${transaction.txIdBE.hex}, new block hash=${blockHash.hex}")
 
-          // If the utxo was marked reserved we want to update it to spent now
-          // since it has been included in a block
-          val unreservedTxo = foundTxo.state match {
-            case TxoState.Reserved =>
-              foundTxo.copyWithState(TxoState.PendingConfirmationsSpent)
-            case TxoState.PendingConfirmationsReceived |
-                TxoState.ConfirmedReceived |
-                TxoState.PendingConfirmationsSpent | TxoState.ConfirmedSpent |
-                TxoState.DoesNotExist | TxoState.ImmatureCoinbase |
-                BroadcastReceived | BroadcastSpent =>
-              foundTxo
-          }
-
           val updateTxDbF = insertTransaction(transaction, blockHashOpt)
 
           // Update Txo State
           updateTxDbF.flatMap(_ =>
-            updateUtxoConfirmedState(unreservedTxo).flatMap {
+            updateUtxoConfirmedState(foundTxo).flatMap {
               case Some(txo) =>
                 logger.debug(
                   s"Updated block_hash of txo=${txo.txid.hex} new block hash=${blockHash.hex}")
                 Future.successful(txo)
               case None =>
                 // State was not updated so we need to update it so it's block hash is in the database
-                spendingInfoDAO.update(unreservedTxo)
+                spendingInfoDAO.update(foundTxo)
             })
         case None =>
           logger.debug(
@@ -626,7 +651,7 @@ private[bitcoins] trait TransactionProcessing extends WalletLogger {
         val totalIncoming = outputsWithIndex.map(_.output.value).sum
 
         val spks = outputsWithIndex.map(_.output.scriptPubKey)
-        val spksInDbF = addressDAO.findByScriptPubKeys(spks.toVector)
+        val spksInDbF = addressDAO.findByScriptPubKeys(spks)
 
         val ourOutputsF = for {
           spksInDb <- spksInDbF
@@ -658,7 +683,7 @@ private[bitcoins] trait TransactionProcessing extends WalletLogger {
               .fromScriptPubKey(out.output.scriptPubKey, networkParameters)
             tagsToUse.map(tag => AddressTagDb(address, tag))
           }
-          created <- addressTagDAO.createAll(newTagDbs.toVector)
+          created <- addressTagDAO.createAll(newTagDbs)
         } yield created
 
         for {

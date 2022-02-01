@@ -1,23 +1,38 @@
 package org.bitcoins.commons.serializers
 
+import org.bitcoins.commons.jsonmodels.bitcoind.GetBlockHeaderResult
 import org.bitcoins.commons.jsonmodels.bitcoind.RpcOpts.LockUnspentOutputParameter
+import org.bitcoins.commons.serializers.JsonReaders.jsToSatoshis
 import org.bitcoins.core.api.wallet.CoinSelectionAlgo
+import org.bitcoins.core.api.wallet.db.SpendingInfoDb
 import org.bitcoins.core.crypto._
 import org.bitcoins.core.currency.{Bitcoins, Satoshis}
 import org.bitcoins.core.dlc.accounting.DLCWalletAccounting
-import org.bitcoins.core.hd.AddressType
-import org.bitcoins.core.number.UInt32
+import org.bitcoins.core.hd.{AddressType, HDPath}
+import org.bitcoins.core.number.{Int32, UInt16, UInt32, UInt64}
+import org.bitcoins.core.protocol.blockchain.Block
 import org.bitcoins.core.protocol.dlc.models.DLCStatus._
 import org.bitcoins.core.protocol.dlc.models._
+import org.bitcoins.core.protocol.script.{
+  ScriptPubKey,
+  ScriptWitness,
+  ScriptWitnessV0,
+  WitnessScriptPubKey
+}
 import org.bitcoins.core.protocol.tlv._
-import org.bitcoins.core.protocol.transaction.{Transaction, TransactionOutPoint}
+import org.bitcoins.core.protocol.transaction.{
+  Transaction,
+  TransactionOutPoint,
+  TransactionOutput
+}
 import org.bitcoins.core.protocol.{BitcoinAddress, BlockStamp}
 import org.bitcoins.core.psbt.InputPSBTRecord.PartialSignature
 import org.bitcoins.core.psbt.PSBT
+import org.bitcoins.core.serializers.PicklerKeys
 import org.bitcoins.core.util.TimeUtil
 import org.bitcoins.core.util.TimeUtil._
 import org.bitcoins.core.wallet.fee.SatoshisPerVirtualByte
-import org.bitcoins.core.wallet.utxo.AddressLabelTag
+import org.bitcoins.core.wallet.utxo.{AddressLabelTag, TxoState}
 import org.bitcoins.crypto._
 import scodec.bits.ByteVector
 import ujson._
@@ -121,15 +136,322 @@ object Picklers {
   implicit val lnMessageDLCOfferTLVPickler: ReadWriter[LnMessage[DLCOfferTLV]] =
     readwriter[String].bimap(_.hex, LnMessageFactory(DLCOfferTLV).fromHex)
 
-  implicit val dlcAcceptTLVPickler: ReadWriter[DLCAcceptTLV] =
-    readwriter[String].bimap(_.hex, DLCAcceptTLV.fromHex)
+  implicit val txoStatePickler: ReadWriter[TxoState] = {
+    readwriter[String].bimap(_.toString.toLowerCase, TxoState.fromString)
+  }
+
+  implicit val privKeyPathPickler: ReadWriter[HDPath] = {
+    readwriter[String].bimap(_.toString, HDPath.fromString)
+  }
+
+  implicit val scriptPubKeyPickler: ReadWriter[ScriptPubKey] = {
+    readwriter[String].bimap(_.asmHex, ScriptPubKey.fromAsmHex(_))
+  }
+
+  private def parseWitnessElements(arr: ujson.Arr): ScriptWitness = {
+    val stackElements = arr.value.toVector.map {
+      case obj: ujson.Obj =>
+        val witnessStr = obj(PicklerKeys.witnessKey).str
+        ByteVector.fromValidHex(witnessStr)
+      case x: ujson.Value =>
+        sys.error(s"Expected witness json object, got=$x")
+    }
+
+    ScriptWitness.apply(stackElements.reverse)
+  }
+
+  private def writeWitnessElements(witness: ScriptWitness): ujson.Arr = {
+    val vec: Vector[ujson.Obj] = witness.stack.reverse.map { w =>
+      ujson.Obj(PicklerKeys.witnessKey -> Str(w.toHex))
+    }.toVector
+
+    ujson.Arr.from(vec)
+  }
+
+  implicit val scriptWitnessPickler: ReadWriter[ScriptWitness] = {
+    readwriter[Arr].bimap(writeWitnessElements, parseWitnessElements)
+  }
+
+  private def writeOutput(o: TransactionOutput): Obj = {
+    Obj(
+      PicklerKeys.satoshisKey -> writeJs(o.value.satoshis),
+      PicklerKeys.scriptPubKeyKey -> writeJs(o.scriptPubKey)
+    )
+  }
+
+  private def readOutput(obj: Obj): TransactionOutput = {
+    val sats = Satoshis(obj(PicklerKeys.satoshisKey).num.toLong)
+    val scriptPubKey =
+      ScriptPubKey.fromAsmHex(obj(PicklerKeys.scriptPubKeyKey).str)
+    TransactionOutput(sats, scriptPubKey)
+  }
+
+  implicit val txOutputPickler: ReadWriter[TransactionOutput] =
+    readwriter[Obj].bimap(writeOutput, readOutput)
+
+  private def writeSpendingInfoDb(si: SpendingInfoDb): Obj = {
+    Obj(
+      PicklerKeys.idKey -> {
+        si.id match {
+          case None     => ujson.Null
+          case Some(id) => Num(id.toDouble)
+        }
+      },
+      PicklerKeys.outPointKey -> writeJs(si.outPoint),
+      PicklerKeys.outputKey -> writeJs(si.output),
+      PicklerKeys.hdPathKey -> writeJs(si.privKeyPath),
+      PicklerKeys.redeemScriptKey -> writeJs(si.redeemScriptOpt),
+      PicklerKeys.witnessKey -> writeJs(si.scriptWitnessOpt),
+      PicklerKeys.stateKey -> writeJs(si.state),
+      PicklerKeys.txIdKey -> writeJs(si.txid),
+      PicklerKeys.spendingTxIdKey -> writeJs(si.spendingTxIdOpt)
+    )
+  }
+
+  private def readSpendingInfoDb(obj: Obj): SpendingInfoDb = {
+    val id = obj(PicklerKeys.idKey).numOpt.map(_.toLong)
+    val outpoint =
+      upickle.default.read[TransactionOutPoint](obj(PicklerKeys.outPointKey))
+    val output =
+      upickle.default.read[TransactionOutput](obj(PicklerKeys.outputKey))
+    val hdPath = upickle.default.read[HDPath](obj(PicklerKeys.hdPathKey))
+    val redeemScript = upickle.default.read[Option[ScriptPubKey]](
+      obj(PicklerKeys.redeemScriptKey))
+    val scriptWitness =
+      upickle.default.read[Option[ScriptWitness]](obj(PicklerKeys.witnessKey))
+    val state = upickle.default.read[TxoState](obj(PicklerKeys.stateKey))
+    val txId =
+      upickle.default.read[DoubleSha256DigestBE](obj(PicklerKeys.txIdKey))
+    val spendingTxId = upickle.default.read[Option[DoubleSha256DigestBE]](
+      obj(PicklerKeys.spendingTxIdKey))
+    SpendingInfoDb(
+      id = id,
+      outpoint = outpoint,
+      output = output,
+      hdPath = hdPath,
+      redeemScriptOpt = redeemScript,
+      scriptWitnessOpt = scriptWitness,
+      state = state,
+      txId = txId,
+      spendingTxIdOpt = spendingTxId
+    )
+  }
+
+  implicit val spendingInfoDbPickler: ReadWriter[SpendingInfoDb] = {
+    readwriter[Obj].bimap(writeSpendingInfoDb, readSpendingInfoDb)
+  }
+
+  private def parseU64(str: ujson.Str): UInt64 = {
+    UInt64(BigInt(str.str))
+  }
+
+  private def parseFundingInput(obj: ujson.Obj): FundingInputTLV = {
+    val inputSerialId = parseU64(obj(PicklerKeys.inputSerialIdKey).str)
+    val prevTx = Transaction.fromHex(obj(PicklerKeys.prevTxKey).str)
+    val prevTxVout = obj(PicklerKeys.prevTxVoutKey).num.toLong
+    val sequence = UInt32(obj(PicklerKeys.sequenceKey).num.toLong)
+    val maxWitnessLen = UInt16(obj(PicklerKeys.maxWitnessLenKey).num.toLong)
+    val redeemScriptStr = obj(PicklerKeys.redeemScriptKey).str
+    val redeemScriptOpt = if (redeemScriptStr.nonEmpty) {
+      val spk =
+        WitnessScriptPubKey.fromAsmHex(obj(PicklerKeys.redeemScriptKey).str)
+      Some(spk)
+    } else {
+      None
+    }
+
+    FundingInputV0TLV(
+      inputSerialId,
+      prevTx,
+      UInt32(prevTxVout),
+      sequence,
+      maxWitnessLen,
+      redeemScriptOpt
+    )
+  }
+
+  private def parseFundingInputs(arr: ujson.Arr): Vector[FundingInputTLV] = {
+    arr.value.toVector.map {
+      case inputObj: ujson.Obj =>
+        parseFundingInput(inputObj)
+      case x: ujson.Value =>
+        sys.error(s"Expected obj, got=$x")
+    }
+  }
+
+  private def parseCetAdaptorSignatures(obj: ujson.Obj): CETSignaturesTLV = {
+    val ecAdaptorSignaturesArr = obj(PicklerKeys.ecdsaAdaptorSignaturesKey).arr
+    val adaptorSigs = parseAdaptorSignatures(ecAdaptorSignaturesArr)
+    CETSignaturesV0TLV(adaptorSigs)
+  }
+
+  private def parseAdaptorSignatures(
+      arr: ujson.Arr): Vector[ECAdaptorSignature] = {
+    arr.value.toVector.map {
+      case obj: ujson.Obj =>
+        ECAdaptorSignature.fromHex(obj(PicklerKeys.signatureKey).str)
+      case x: ujson.Value =>
+        sys.error(s"Excpected string for ecdsa adaptor siganture, got obj=$x")
+    }
+  }
+
+  private def writeAdaptorSignatures(
+      sigs: Vector[ECAdaptorSignature]): Vector[ujson.Obj] = {
+    sigs.map { sig =>
+      ujson.Obj(PicklerKeys.signatureKey -> Str(sig.hex))
+    }
+  }
+
+  private def writeCetAdaptorSigs(
+      cetSignaturesTLV: CETSignaturesTLV): ujson.Obj = {
+    cetSignaturesTLV match {
+      case v0: CETSignaturesV0TLV =>
+        val sigsVec = writeAdaptorSignatures(v0.sigs)
+        ujson.Obj(
+          PicklerKeys.ecdsaAdaptorSignaturesKey -> ujson.Arr.from(sigsVec))
+    }
+  }
+
+  private def readAcceptTLV(obj: ujson.Obj): DLCAcceptTLV = {
+    val tempContractId =
+      Sha256Digest.fromHex(obj(PicklerKeys.temporaryContractIdKey).str)
+    val acceptCollateral = Satoshis(
+      obj(PicklerKeys.acceptCollateralKey).num.toLong)
+    val fundingPubKey =
+      ECPublicKey.fromHex(obj(PicklerKeys.fundingPubKeyKey).str)
+    val payoutSpk = ScriptPubKey.fromAsmHex(obj(PicklerKeys.payoutSpkKey).str)
+    val payoutSerialId = parseU64(obj(PicklerKeys.payoutSerialIdKey).str)
+    val fundingInputs = parseFundingInputs(
+      obj(PicklerKeys.fundingInputsKey).arr)
+    val changeSpk = ScriptPubKey.fromAsmHex(obj(PicklerKeys.changeSpkKey).str)
+    val changeSerialId = parseU64(obj(PicklerKeys.changeSerialIdKey).str)
+    val cetAdaptorSigs = parseCetAdaptorSignatures(
+      obj(PicklerKeys.cetAdaptorSignaturesKey).obj)
+    val refundSignature =
+      ECDigitalSignature.fromHex(obj(PicklerKeys.refundSignatureKey).str)
+    val negotiationFields = {
+      obj(PicklerKeys.negotiationFieldsKey).strOpt match {
+        case Some(str) =>
+          sys.error(s"Don't know how to parse negotiation fields, got=$str")
+        case None => NegotiationFieldsTLV.empty
+      }
+    }
+
+    val acceptTLV = DLCAcceptTLV(
+      tempContractId = tempContractId,
+      totalCollateralSatoshis = acceptCollateral,
+      fundingPubKey = fundingPubKey,
+      payoutSPK = payoutSpk,
+      payoutSerialId = payoutSerialId,
+      fundingInputs = fundingInputs,
+      changeSPK = changeSpk,
+      changeSerialId = changeSerialId,
+      cetSignatures = cetAdaptorSigs,
+      refundSignature = refundSignature,
+      negotiationFields = negotiationFields
+    )
+
+    acceptTLV
+  }
+
+  private def writeAcceptTLV(accept: DLCAcceptTLV): ujson.Obj = {
+    Obj(
+      PicklerKeys.tempContractIdKey -> Str(accept.tempContractId.hex),
+      PicklerKeys.acceptCollateralKey -> Num(
+        accept.totalCollateralSatoshis.toLong.toDouble),
+      PicklerKeys.fundingPubKeyKey -> Str(accept.fundingPubKey.hex),
+      PicklerKeys.payoutSpkKey -> Str(accept.payoutSPK.asmHex),
+      PicklerKeys.payoutSerialIdKey -> Str(
+        accept.payoutSerialId.toBigInt.toString()),
+      PicklerKeys.fundingInputsKey -> writeJs(accept.fundingInputs),
+      PicklerKeys.changeSpkKey -> Str(accept.changeSPK.asmHex),
+      PicklerKeys.changeSerialIdKey -> Str(
+        accept.changeSerialId.toBigInt.toString()),
+      PicklerKeys.cetAdaptorSignaturesKey -> writeCetAdaptorSigs(
+        accept.cetSignatures),
+      PicklerKeys.refundSignatureKey -> Str(accept.refundSignature.hex),
+      PicklerKeys.negotiationFieldsKey -> ujson.Null
+    )
+  }
+
+  private def parseFundingSignatures(obj: ujson.Obj): FundingSignaturesTLV = {
+    val fundingSignatures: Vector[ujson.Value] = obj(
+      PicklerKeys.fundingSignaturesKey).arr.toVector
+    val witV0 = paresFundingSignaturesArr(fundingSignatures)
+    FundingSignaturesV0TLV(witV0)
+  }
+
+  private def paresFundingSignaturesArr(
+      arr: Vector[ujson.Value]): Vector[ScriptWitnessV0] = {
+    arr.map {
+      case obj: ujson.Obj =>
+        val witnessElementsArr = obj(PicklerKeys.witnessElementsKey).arr
+        val witness: ScriptWitness = {
+          parseWitnessElements(witnessElementsArr)
+        }
+
+        val scriptWitnessV0 = witness.asInstanceOf[ScriptWitnessV0]
+        scriptWitnessV0
+      case x =>
+        sys.error(s"Expected array of objects for funding signatures, got=$x")
+    }
+  }
+
+  private def writeFundingSignatures(
+      fundingSigs: FundingSignaturesTLV): ujson.Obj = {
+    val sigs: Vector[ujson.Obj] = fundingSigs match {
+      case v0: FundingSignaturesV0TLV =>
+        val witnessJson: Vector[Obj] = {
+          v0.witnesses.map { wit =>
+            val witJson = writeWitnessElements(wit)
+            ujson.Obj(PicklerKeys.witnessElementsKey -> witJson)
+          }
+        }
+        witnessJson
+    }
+    ujson.Obj(
+      PicklerKeys.fundingSignaturesKey -> ujson.Arr.from(sigs)
+    )
+  }
+
+  private def readSignTLV(obj: ujson.Obj): DLCSignTLV = {
+    val contractId = ByteVector.fromValidHex(obj(PicklerKeys.contractIdKey).str)
+    val adaptorSigs = parseCetAdaptorSignatures(
+      obj(PicklerKeys.cetAdaptorSignaturesKey).obj)
+    val refundSignature =
+      ECDigitalSignature.fromHex(obj(PicklerKeys.refundSignatureKey).str)
+    val fundingSignatures = parseFundingSignatures(
+      obj(PicklerKeys.fundingSignaturesKey).obj)
+
+    val signTLV =
+      DLCSignTLV(contractId, adaptorSigs, refundSignature, fundingSignatures)
+
+    signTLV
+
+  }
+
+  private def writeSignTLV(sign: DLCSignTLV): ujson.Obj = {
+    ujson.Obj(
+      PicklerKeys.contractIdKey -> sign.contractId.toHex,
+      PicklerKeys.cetAdaptorSignaturesKey -> writeCetAdaptorSigs(
+        sign.cetSignatures),
+      PicklerKeys.refundSignatureKey -> ujson.Str(sign.refundSignature.hex),
+      PicklerKeys.fundingSignaturesKey ->
+        writeFundingSignatures(sign.fundingSignatures)
+    )
+  }
+
+  implicit val dlcAcceptTLVPickler: ReadWriter[DLCAcceptTLV] = {
+    readwriter[ujson.Obj].bimap(writeAcceptTLV, readAcceptTLV)
+  }
+
+  implicit val dlcSignTLVPickler: ReadWriter[DLCSignTLV] = {
+    readwriter[ujson.Obj].bimap(writeSignTLV, readSignTLV)
+  }
 
   implicit val lnMessageDLCAcceptTLVPickler: ReadWriter[
     LnMessage[DLCAcceptTLV]] =
     readwriter[String].bimap(_.hex, LnMessageFactory(DLCAcceptTLV).fromHex)
-
-  implicit val dlcSignTLVPickler: ReadWriter[DLCSignTLV] =
-    readwriter[String].bimap(_.hex, DLCSignTLV.fromHex)
 
   implicit val lnMessageDLCSignTLVPickler: ReadWriter[LnMessage[DLCSignTLV]] =
     readwriter[String].bimap(_.hex, LnMessageFactory(DLCSignTLV).fromHex)
@@ -142,6 +464,10 @@ object Picklers {
 
   implicit val transactionPickler: ReadWriter[Transaction] =
     readwriter[String].bimap(_.hex, Transaction.fromHex)
+
+  implicit val blockPickler: ReadWriter[Block] = {
+    readwriter[String].bimap(_.hex, Block.fromHex)
+  }
 
   implicit val extPubKeyPickler: ReadWriter[ExtPublicKey] =
     readwriter[String].bimap(_.toString, ExtPublicKey.fromString)
@@ -168,13 +494,15 @@ object Picklers {
 
       val descriptorJson = announcement.eventTLV.eventDescriptor match {
         case EnumEventDescriptorV0TLV(outcomes) =>
-          Obj("outcomes" -> outcomes.map(Str(_)))
+          Obj("outcomes" -> outcomes.map(Str(_)),
+              "hex" -> announcement.eventTLV.eventDescriptor.hex)
         case numeric: NumericEventDescriptorTLV =>
           Obj(
             "base" -> Num(numeric.base.toLong.toDouble),
             "isSigned" -> Bool(numeric.isSigned),
             "unit" -> Str(numeric.unit),
-            "precision" -> Num(numeric.precision.toLong.toDouble)
+            "precision" -> Num(numeric.precision.toLong.toDouble),
+            "hex" -> announcement.eventTLV.eventDescriptor.hex
           )
       }
 
@@ -189,7 +517,9 @@ object Picklers {
       Obj(
         "announcementSignature" -> Str(announcement.announcementSignature.hex),
         "publicKey" -> Str(announcement.publicKey.hex),
-        "event" -> eventJson)
+        "event" -> eventJson,
+        "hex" -> announcement.hex
+      )
     }
 
   // can't make implicit because it will overlap with ones needed for cli
@@ -206,7 +536,8 @@ object Picklers {
 
       Obj("eventId" -> Str(attestments.eventId),
           "signatures" -> sigsJson,
-          "values" -> valuesJson)
+          "values" -> valuesJson,
+          "hex" -> attestments.hex)
     }
 
   implicit val fundingInputV0Writer: Writer[FundingInputTLV] =
@@ -220,11 +551,11 @@ object Picklers {
 
       val redeemScriptJson = redeemScriptOpt match {
         case Some(rs) => Str(rs.hex)
-        case None     => ujson.Null
+        case None     => Str("")
       }
 
       Obj(
-        "inputSerialId" -> Num(inputSerialId.toBigInt.toDouble),
+        "inputSerialId" -> Str(inputSerialId.toBigInt.toString()),
         "prevTx" -> Str(prevTx.hex),
         "prevTxVout" -> Num(prevTxVout.toLong.toDouble),
         "sequence" -> Num(sequence.toLong.toDouble),
@@ -233,33 +564,87 @@ object Picklers {
       )
     }
 
-  implicit val contractDescriptorV0Writer: Writer[ContractDescriptorV0TLV] =
-    writer[Obj].comap { v0 =>
-      import v0._
+  implicit val tlvPointReader: Reader[TLVPoint] = {
+    reader[Obj].map { obj: Obj =>
+      val map = obj.value
+      val outcome = map(PicklerKeys.outcomeKey).num.toLong
+      val payout = jsToSatoshis(map(PicklerKeys.payoutKey))
+      val extraPrecision = map(PicklerKeys.extraPrecisionKey).num.toInt
+      TLVPoint(outcome, payout, extraPrecision)
+    }
+  }
 
-      val outcomesJs = outcomes.map { case (outcome, payout) =>
-        Obj("outcome" -> Str(outcome),
-            "localPayout" -> Num(payout.toLong.toDouble))
-      }
+  implicit val tlvPointWriter: Writer[TLVPoint] = {
+    writer[Obj].comap { point =>
+      Obj(
+        PicklerKeys.outcomeKey -> Num(point.outcome.toDouble),
+        PicklerKeys.payoutKey -> Num(point.value.toLong.toDouble),
+        PicklerKeys.extraPrecisionKey -> Num(point.extraPrecision.toDouble)
+      )
+    }
+  }
 
-      Obj("outcomes" -> outcomesJs)
+  implicit val hyperbolaPayoutCurvePieceTLVWriter: Writer[
+    HyperbolaPayoutCurvePieceTLV] = {
+    writer[Obj].comap { piece =>
+      Obj(
+        PicklerKeys.usePositivePiece -> Bool(piece.usePositivePiece),
+        PicklerKeys.translateOutcome -> Num(
+          piece.translateOutcome.toBigDecimal.toDouble),
+        PicklerKeys.translatePayout -> Num(
+          piece.translatePayout.toBigDecimal.toDouble),
+        PicklerKeys.a -> Num(piece.a.toBigDecimal.toDouble),
+        PicklerKeys.b -> Num(piece.b.toBigDecimal.toDouble),
+        PicklerKeys.c -> Num(piece.c.toBigDecimal.toDouble),
+        PicklerKeys.d -> Num(piece.d.toBigDecimal.toDouble)
+      )
     }
 
-  implicit val payoutFunctionV0TLVWriter: Writer[PayoutFunctionV0TLV] =
+  }
+
+  implicit val payoutFunctionV0TLVWriter: Writer[PayoutFunctionV0TLV] = {
+    def endpoint(json: Value, isEndpoint: Boolean): Value = json match {
+      case obj: Obj =>
+        //drop old value on the floor if there is one
+        obj.value.put(PicklerKeys.isEndpointKey, Bool(isEndpoint))
+        Obj(obj.value)
+      case v: Value => v
+    }
+
     writer[Obj].comap { payoutFunc =>
-      import payoutFunc._
-
-      val pointsJs = points.map { point =>
-        Obj(
-          "outcome" -> Num(point.outcome.toDouble),
-          "payout" -> Num(point.value.toLong.toDouble),
-          "extraPrecision" -> Num(point.extraPrecision.toDouble),
-          "isEndpoint" -> Bool(point.isEndpoint)
-        )
+      val endPointsJs = payoutFunc.endpoints.map { point =>
+        endpoint(writeJs(point), isEndpoint = true)
       }
 
-      Obj("points" -> pointsJs)
+      val midPointJs = payoutFunc.pieces.flatMap {
+        case polynomialPiece: PolynomialPayoutCurvePieceTLV =>
+          polynomialPiece.midpoints.map { point =>
+            endpoint(writeJs(point), isEndpoint = false)
+          }
+        case hyperbolaPiece: HyperbolaPayoutCurvePieceTLV =>
+          Vector(writeJs(hyperbolaPiece))
+      }
+
+      Obj(PicklerKeys.pointsKey -> (endPointsJs ++ midPointJs))
     }
+  }
+
+  implicit val payoutFunctionV0TLVReader: Reader[PayoutFunctionV0TLV] = {
+    reader[Obj].map { obj: Obj =>
+      val pointsArr = obj(PicklerKeys.pointsKey).arr
+      val points: Vector[TLVPoint] = pointsArr.map {
+        case x @ (_: Arr | _: Num | Null | _: Bool | _: Str) =>
+          sys.error(
+            s"Cannot have $x when parsing payout curve points, expected json object")
+        case obj: Obj =>
+          upickle.default.read[TLVPoint](obj)
+      }.toVector
+
+      DLCPayoutCurve
+        .fromPoints(points, serializationVersion = DLCSerializationVersion.Beta)
+        .toTLV
+    }
+  }
 
   implicit val roundingIntervalsV0TLVWriter: Writer[RoundingIntervalsV0TLV] =
     writer[Obj].comap { roundingIntervals =>
@@ -273,19 +658,35 @@ object Picklers {
       Obj("intervals" -> intervalsJs)
     }
 
+  implicit val contractDescriptorV0: ReadWriter[ContractDescriptorV0TLV] = {
+    readwriter[Value].bimap(contractV0Writer, contractV0Reader)
+  }
+
+  private def contractV0Reader(value: Value): ContractDescriptorV0TLV = {
+    parseContractDescriptor(value)
+  }
+
+  private def contractV0Writer(v0: ContractDescriptorV0TLV): Value = {
+    val outcomesJs: ujson.Obj = v0.outcomes.map { case (outcome, payout) =>
+      outcome -> Num(payout.toLong.toDouble)
+    }
+    Obj(PicklerKeys.outcomesKey -> outcomesJs, "hex" -> v0.hex)
+  }
+
   implicit val contractDescriptorV1Writer: Writer[ContractDescriptorV1TLV] =
     writer[Obj].comap { v1 =>
       import v1._
 
       Obj("numDigits" -> Num(numDigits.toDouble),
           "payoutFunction" -> writeJs(payoutFunction),
-          "roundingIntervals" -> writeJs(roundingIntervals))
+          "roundingIntervals" -> writeJs(roundingIntervals),
+          "hex" -> v1.hex)
     }
 
   implicit val contractDescriptorWriter: Writer[ContractDescriptorTLV] =
     writer[Value].comap {
       case v0: ContractDescriptorV0TLV =>
-        writeJs(v0)(contractDescriptorV0Writer)
+        writeJs(v0)(contractDescriptorV0)
       case v1: ContractDescriptorV1TLV =>
         writeJs(v1)(contractDescriptorV1Writer)
     }
@@ -339,10 +740,41 @@ object Picklers {
     writer[Obj].comap { contractInfo =>
       import contractInfo._
 
-      Obj("totalCollateral" -> Num(totalCollateral.toLong.toDouble),
-          "contractDescriptor" -> writeJs(contractDescriptor),
-          "oracleInfo" -> writeJs(oracleInfo))
+      Obj(
+        PicklerKeys.totalCollateralKey -> writeJs(totalCollateral),
+        PicklerKeys.contractDescriptorKey -> writeJs(contractDescriptor),
+        PicklerKeys.oracleInfoKey -> writeJs(oracleInfo)
+      )
     }
+
+  val contractInfoV1TLVJsonWriter: Writer[ContractInfoV1TLV] = {
+    writer[Obj].comap { contractInfo =>
+      val arrayVec: Vector[ujson.Obj] = contractInfo.contractOraclePairs.map {
+        case (c, o) =>
+          val contractDescriptorJson = writeJs(c)
+          val oracleInfoJson = writeJs(o)
+          ujson.Obj(PicklerKeys.contractDescriptorKey -> contractDescriptorJson,
+                    PicklerKeys.oracleInfoKey -> oracleInfoJson)
+      }
+
+      val arrayJson = ujson.Arr.from(arrayVec)
+
+      Obj(
+        PicklerKeys.totalCollateralKey -> Num(
+          contractInfo.totalCollateral.toLong.toDouble),
+        PicklerKeys.pairsKey -> arrayJson
+      )
+    }
+  }
+
+  val contractInfoJsonWriter: Writer[ContractInfoTLV] = {
+    writer[ujson.Value].comap {
+      case contractInfoV0TLV: ContractInfoV0TLV =>
+        writeJs(contractInfoV0TLV)(contractInfoV0TLVJsonWriter)
+      case contractInfoV1TLV: ContractInfoV1TLV =>
+        writeJs(contractInfoV1TLV)(contractInfoV1TLVJsonWriter)
+    }
+  }
 
   implicit val offerTLVWriter: Writer[DLCOfferTLV] =
     writer[Obj].comap { offer =>
@@ -350,7 +782,7 @@ object Picklers {
       Obj(
         "contractFlags" -> Str(contractFlags.toHexString),
         "chainHash" -> Str(chainHash.hex),
-        "contractInfo" -> writeJs(contractInfo)(contractInfoV0TLVJsonWriter),
+        "contractInfo" -> writeJs(contractInfo)(contractInfoJsonWriter),
         "fundingPubKey" -> Str(fundingPubKey.hex),
         "payoutSPK" -> Str(payoutSPK.hex),
         "payoutSerialId" -> Num(payoutSerialId.toBigInt.toDouble),
@@ -358,7 +790,7 @@ object Picklers {
           totalCollateralSatoshis.toLong.toDouble),
         "fundingInputs" -> fundingInputs.map(i => writeJs(i)),
         "changeSPK" -> Str(changeSPK.hex),
-        "changeSerialId" -> Num(changeSerialId.toBigInt.toDouble),
+        "changeSerialId" -> Str(changeSerialId.toBigInt.toString()),
         "fundOutputSerialId" -> Num(fundOutputSerialId.toBigInt.toDouble),
         "feeRatePerVb" -> Num(feeRate.toLong.toDouble),
         "cetLocktime" -> Num(contractMaturityBound.toUInt32.toLong.toDouble),
@@ -832,4 +1264,91 @@ object Picklers {
 
   implicit val addressTypePickler: ReadWriter[AddressType] =
     readwriter[String].bimap(_.toString, AddressType.fromString)
+
+  def parseContractDescriptor(payoutsVal: Value): ContractDescriptorV0TLV = {
+    val outcomes = payoutsVal(PicklerKeys.outcomesKey)
+    val payouts: Vector[(String, Satoshis)] = outcomes.obj.toVector.map {
+      case (outcome, payoutJs) =>
+        val payout = jsToSatoshis(payoutJs.num)
+        (outcome, payout)
+    }
+    ContractDescriptorV0TLV(outcomes = payouts)
+  }
+
+  private def readBlockHeaderResult(obj: Obj): GetBlockHeaderResult = {
+    val hash = DoubleSha256DigestBE.fromHex(obj(PicklerKeys.hashKey).str)
+    val confirmations = obj(PicklerKeys.confirmationsKey).num.toInt
+    val height = obj(PicklerKeys.heightKey).num.toInt
+    val version = obj(PicklerKeys.versionKey).num.toInt
+    val versionHex = Int32.fromHex(obj(PicklerKeys.versionHexKey).str)
+    val merkleroot =
+      DoubleSha256DigestBE.fromHex(obj(PicklerKeys.merklerootKey).str)
+    val time = UInt32(obj(PicklerKeys.timeKey).num.toLong)
+    val mediantime = UInt32(obj(PicklerKeys.mediantimeKey).num.toLong)
+    val nonce = UInt32(obj(PicklerKeys.nonceKey).num.toLong)
+    val bits = UInt32.fromHex(obj(PicklerKeys.bitsKey).str)
+    val difficulty = obj(PicklerKeys.difficultyKey).num
+    val chainWork = obj(PicklerKeys.chainworkKey).str
+    val previousBlockHash = obj(PicklerKeys.previousblockhashKey).strOpt.map {
+      str =>
+        DoubleSha256DigestBE.fromHex(str)
+    }
+
+    val nextblockhash = obj(PicklerKeys.nextblockhashKey).strOpt.map { str =>
+      DoubleSha256DigestBE.fromHex(str)
+    }
+
+    GetBlockHeaderResult(
+      hash = hash,
+      confirmations = confirmations,
+      height = height,
+      version = version,
+      versionHex = versionHex,
+      merkleroot = merkleroot,
+      time = time,
+      mediantime = mediantime,
+      nonce = nonce,
+      bits = bits,
+      difficulty = difficulty,
+      chainwork = chainWork,
+      previousblockhash = previousBlockHash,
+      nextblockhash = nextblockhash
+    )
+  }
+
+  private def writeBlockHeaderResult(header: GetBlockHeaderResult): Obj = {
+    val json = Obj(
+      PicklerKeys.rawKey -> Str(header.blockHeader.hex),
+      PicklerKeys.hashKey -> Str(header.hash.hex),
+      PicklerKeys.confirmationsKey -> Num(header.confirmations),
+      PicklerKeys.heightKey -> Num(header.height),
+      PicklerKeys.versionKey -> Num(header.version.toLong.toDouble),
+      PicklerKeys.versionHexKey -> Str(Int32(header.version).hex),
+      PicklerKeys.merklerootKey -> Str(header.merkleroot.hex),
+      PicklerKeys.timeKey -> Num(header.time.toBigInt.toDouble),
+      PicklerKeys.mediantimeKey -> Num(header.mediantime.toLong.toDouble),
+      PicklerKeys.nonceKey -> Num(header.nonce.toBigInt.toDouble),
+      PicklerKeys.bitsKey -> Str(header.bits.hex),
+      PicklerKeys.difficultyKey -> Num(header.difficulty.toDouble),
+      PicklerKeys.chainworkKey -> Str(header.chainwork),
+      PicklerKeys.previousblockhashKey -> {
+        header.previousblockhash.map(_.hex) match {
+          case Some(str) => Str(str)
+          case None      => ujson.Null
+        }
+      },
+      PicklerKeys.nextblockhashKey -> {
+        header.nextblockhash.map(_.hex) match {
+          case Some(str) => Str(str)
+          case None      => ujson.Null
+        }
+      }
+    )
+    json
+  }
+
+  implicit val getBlockHeaderResultPickler: ReadWriter[GetBlockHeaderResult] = {
+    readwriter[ujson.Obj]
+      .bimap(writeBlockHeaderResult(_), readBlockHeaderResult(_))
+  }
 }

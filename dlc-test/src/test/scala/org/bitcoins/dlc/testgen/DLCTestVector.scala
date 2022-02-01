@@ -117,7 +117,8 @@ case class DLCPartyParams(
 
   def toOffer(params: DLCParams): DLCOffer = {
     DLCOffer(
-      ContractInfo(
+      DLCOfferTLV.currentVersionOpt,
+      SingleContractInfo(
         EnumContractDescriptor(params.contractInfo.map(_.toMapEntry)),
         params.oracleInfo),
       DLCPublicKeys(fundingPrivKey.publicKey, payoutAddress),

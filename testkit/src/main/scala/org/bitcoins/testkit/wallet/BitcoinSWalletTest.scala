@@ -15,16 +15,12 @@ import org.bitcoins.core.util.FutureUtil
 import org.bitcoins.core.wallet.fee._
 import org.bitcoins.crypto.{DoubleSha256Digest, DoubleSha256DigestBE}
 import org.bitcoins.dlc.wallet.{DLCAppConfig, DLCWallet}
-import org.bitcoins.keymanager.bip39.BIP39KeyManager
-import org.bitcoins.node.{
-  NodeCallbacks,
-  OnBlockReceived,
-  OnCompactFiltersReceived,
-  OnMerkleBlockReceived
-}
+import org.bitcoins.node.config.NodeAppConfig
+import org.bitcoins.node.{NodeCallbacks, OnMerkleBlockReceived}
 import org.bitcoins.rpc.client.common.{BitcoindRpcClient, BitcoindVersion}
 import org.bitcoins.rpc.client.v19.BitcoindV19RpcClient
 import org.bitcoins.server.BitcoinSAppConfig
+import org.bitcoins.server.util.CallbackUtil
 import org.bitcoins.testkit.EmbeddedPg
 import org.bitcoins.testkit.chain.SyncUtil
 import org.bitcoins.testkit.fixtures.BitcoinSFixture
@@ -73,11 +69,9 @@ trait BitcoinSWalletTest
     walletConfig =>
       implicit val newWalletConf =
         getFreshWalletAppConfig.withOverrides(walletConfig)
-      val km = createNewKeyManager()(newWalletConf)
       val bip39PasswordOpt = KeyManagerTestUtil.bip39PasswordOpt
       makeDependentFixture(
-        build = createNewWallet(keyManager = km,
-                                bip39PasswordOpt = bip39PasswordOpt,
+        build = createNewWallet(bip39PasswordOpt = bip39PasswordOpt,
                                 extraConfig = Some(walletConfig),
                                 nodeApi = nodeApi,
                                 chainQueryApi = chainQueryApi),
@@ -217,7 +211,7 @@ trait BitcoinSWalletTest
             .createBitcoindWithFunds(Some(BitcoindVersion.V19))
             .map(_.asInstanceOf[BitcoindV19RpcClient])
         wallet <- createWalletWithBitcoindCallbacks(bitcoind, bip39PasswordOpt)
-        fundedWallet <- fundWalletWithBitcoind(wallet)
+        fundedWallet <- FundWalletUtil.fundWalletWithBitcoind(wallet)
         _ <- SyncUtil.syncWalletFullBlocks(wallet = fundedWallet.wallet,
                                            bitcoind = bitcoind)
         _ <- BitcoinSWalletTest.awaitWalletBalances(fundedWallet)
@@ -232,6 +226,17 @@ trait BitcoinSWalletTest
   def withWalletConfig(test: OneArgAsyncTest): FutureOutcome = {
     val builder: () => Future[WalletAppConfig] = () => {
       createWalletAppConfig(pgUrl, Vector.empty)
+    }
+
+    val destroy: WalletAppConfig => Future[Unit] = walletAppConfig => {
+      destroyWalletAppConfig(walletAppConfig)
+    }
+    makeDependentFixture(builder, destroy = destroy)(test)
+  }
+
+  def withWalletConfigNotStarted(test: OneArgAsyncTest): FutureOutcome = {
+    val builder: () => Future[WalletAppConfig] = () => {
+      createWalletAppConfigNotStarted(pgUrl, Vector.empty)
     }
 
     val destroy: WalletAppConfig => Future[Unit] = walletAppConfig => {
@@ -291,27 +296,17 @@ object BitcoinSWalletTest extends WalletLogger {
 
     override def epochSecondToBlockHeight(time: Long): Future[Int] =
       Future.successful(0)
-  }
 
-  private def createNewKeyManager(
-      bip39PasswordOpt: Option[String] = KeyManagerTestUtil.bip39PasswordOpt)(
-      implicit config: WalletAppConfig): BIP39KeyManager = {
-    val keyManagerE = BIP39KeyManager.initialize(config.aesPasswordOpt,
-                                                 kmParams = config.kmParams,
-                                                 bip39PasswordOpt =
-                                                   bip39PasswordOpt)
-    keyManagerE match {
-      case Right(keyManager) => keyManager
-      case Left(err) =>
-        throw new RuntimeException(s"Cannot initialize key manager err=${err}")
-    }
+    /** calculates the median time passed */
+    override def getMedianTimePast(): Future[Long] =
+      Future.successful(0L)
   }
 
   private[bitcoins] class RandomFeeProvider extends FeeRateApi {
     // Useful for tests
     var lastFeeRate: Option[FeeUnit] = None
 
-    override def getFeeRate: Future[FeeUnit] = {
+    override def getFeeRate(): Future[FeeUnit] = {
       val feeRate = FeeUnitGen.feeUnit.sampleSome
 
       lastFeeRate = Some(feeRate)
@@ -324,6 +319,17 @@ object BitcoinSWalletTest extends WalletLogger {
       configs: Vector[Config])(implicit
       system: ActorSystem): Future[WalletAppConfig] = {
     import system.dispatcher
+    val walletAppConfigF = createWalletAppConfigNotStarted(pgUrl, configs)
+    for {
+      appConfig <- walletAppConfigF
+      _ <- appConfig.start()
+    } yield appConfig
+  }
+
+  def createWalletAppConfigNotStarted(
+      pgUrl: () => Option[String],
+      configs: Vector[Config])(implicit
+      system: ActorSystem): Future[WalletAppConfig] = {
     val baseConf = BaseWalletTest.getFreshWalletAppConfig(pgUrl, configs)
     val walletNameOpt = if (NumberGenerator.bool.sampleSome) {
       Some(StringGenerators.genNonEmptyString.sampleSome)
@@ -337,11 +343,11 @@ object BitcoinSWalletTest extends WalletLogger {
 
         BitcoinSAppConfig(
           baseConf.baseDatadir,
-          (walletNameOverride +: baseConf.configOverrides): _*).walletConf
+          (walletNameOverride +: baseConf.configOverrides)).walletConf
       case None => baseConf
     }
 
-    walletConf.start().map(_ => walletConf)
+    Future.successful(walletConf)
   }
 
   /** Returns a function that can be used to create a wallet fixture.
@@ -351,66 +357,79 @@ object BitcoinSWalletTest extends WalletLogger {
     * or account type.
     */
   private def createNewWallet(
-      keyManager: BIP39KeyManager,
       bip39PasswordOpt: Option[String],
       extraConfig: Option[Config],
       nodeApi: NodeApi,
       chainQueryApi: ChainQueryApi)(implicit
       config: WalletAppConfig,
-      ec: ExecutionContext): () => Future[Wallet] =
-    () => {
+      ec: ExecutionContext): () => Future[Wallet] = { () =>
+    {
       val walletConfig = extraConfig match {
         case None    => config
         case Some(c) => config.withOverrides(c)
+      }
+
+      val walletConfigWithBip39Pw = bip39PasswordOpt match {
+        case Some(pw) =>
+          val str = s"""bitcoin-s.keymanager.bip39password="$pw""""
+          val bip39Config = ConfigFactory.parseString(str)
+          walletConfig.withOverrides(bip39Config)
+        case None => walletConfig
       }
 
       // we want to check we're not overwriting
       // any user data
       AppConfig.throwIfDefaultDatadir(walletConfig)
 
-      walletConfig.start().flatMap { _ =>
+      walletConfigWithBip39Pw.start().flatMap { _ =>
         val wallet =
-          Wallet(keyManager,
-                 nodeApi,
-                 chainQueryApi,
-                 new RandomFeeProvider,
-                 keyManager.creationTime)(walletConfig, ec)
+          Wallet(nodeApi, chainQueryApi, new RandomFeeProvider)(
+            walletConfigWithBip39Pw,
+            ec)
         Wallet.initialize(wallet, bip39PasswordOpt)
       }
     }
+  }
 
   private def createDLCWallet(
-      keyManager: BIP39KeyManager,
       bip39PasswordOpt: Option[String],
       extraConfig: Option[Config],
       nodeApi: NodeApi,
       chainQueryApi: ChainQueryApi)(implicit
       config: BitcoinSAppConfig,
       ec: ExecutionContext): Future[DLCWallet] = {
-    val defaultConf = config.walletConf
+
     val walletConfig = extraConfig match {
-      case None    => defaultConf
-      case Some(c) => defaultConf.withOverrides(c)
+      case None    => config
+      case Some(c) => config.withOverrides(Vector(c))
+    }
+
+    val walletConfigWithBip39Pw = bip39PasswordOpt match {
+      case Some(pw) =>
+        val str = s"""bitcoin-s.keymanager.bip39password="$pw""""
+        val bip39Config = ConfigFactory.parseString(str)
+        walletConfig.withOverrides(Vector(bip39Config))
+      case None => walletConfig
     }
 
     // we want to check we're not overwriting
     // any user data
-    AppConfig.throwIfDefaultDatadir(walletConfig)
+    AppConfig.throwIfDefaultDatadir(walletConfigWithBip39Pw.walletConf)
 
     val initConfs = for {
-      _ <- walletConfig.start()
+      _ <- walletConfigWithBip39Pw.walletConf.start()
       _ <- config.dlcConf.start()
     } yield ()
 
     initConfs.flatMap { _ =>
       val wallet =
-        DLCWallet(keyManager,
-                  nodeApi,
-                  chainQueryApi,
-                  new RandomFeeProvider,
-                  keyManager.creationTime)(walletConfig, config.dlcConf, ec)
+        DLCWallet(nodeApi, chainQueryApi, new RandomFeeProvider)(
+          walletConfigWithBip39Pw.walletConf,
+          config.dlcConf,
+          ec)
+
       Wallet
-        .initialize(wallet, bip39PasswordOpt)(walletConfig, ec)
+        .initialize(wallet, bip39PasswordOpt)
         .map(_.asInstanceOf[DLCWallet])
     }
   }
@@ -429,14 +448,12 @@ object BitcoinSWalletTest extends WalletLogger {
       case Some(walletConf) =>
         config.withOverrides(walletConf)
     }
-    val km =
-      createNewKeyManager(bip39PasswordOpt = bip39PasswordOpt)(newWalletConf)
-    createNewWallet(
-      keyManager = km,
-      bip39PasswordOpt = bip39PasswordOpt,
-      extraConfig = extraConfig,
-      nodeApi = nodeApi,
-      chainQueryApi = chainQueryApi)(config, ec)() // get the standard config
+    createNewWallet(bip39PasswordOpt = bip39PasswordOpt,
+                    extraConfig = extraConfig,
+                    nodeApi = nodeApi,
+                    chainQueryApi = chainQueryApi)(newWalletConf,
+                                                   ec
+    )() // get the standard config
   }
 
   /** Creates a default wallet with bitcoind where the [[ChainQueryApi]] fed to the wallet
@@ -462,12 +479,10 @@ object BitcoinSWalletTest extends WalletLogger {
       //create the wallet with the appropriate callbacks now that
       //we have them
       walletWithCallback = Wallet(
-        keyManager = wallet.keyManager,
         nodeApi =
           SyncUtil.getNodeApiWalletCallback(bitcoind, walletCallbackP.future),
         chainQueryApi = bitcoind,
-        feeRateApi = new RandomFeeProvider,
-        creationTime = wallet.keyManager.creationTime
+        feeRateApi = new RandomFeeProvider
       )(wallet.walletConfig, wallet.ec)
       //complete the walletCallbackP so we can handle the callbacks when they are
       //called without hanging forever.
@@ -508,15 +523,11 @@ object BitcoinSWalletTest extends WalletLogger {
       config: BitcoinSAppConfig,
       system: ActorSystem): Future[DLCWallet] = {
     implicit val ec: ExecutionContextExecutor = system.dispatcher
-    val km =
-      createNewKeyManager(bip39PasswordOpt = bip39PasswordOpt)(
-        config.walletConf)
     for {
-      wallet <- createDLCWallet(km,
-                                bip39PasswordOpt,
-                                extraConfig,
-                                nodeApi,
-                                chainQueryApi)
+      wallet <- createDLCWallet(bip39PasswordOpt = bip39PasswordOpt,
+                                extraConfig = extraConfig,
+                                nodeApi = nodeApi,
+                                chainQueryApi = chainQueryApi)
       account1 = WalletTestUtil.getHdAccount1(wallet.walletConfig)
       newAccountWallet <- wallet.createNewAccount(hdAccount = account1,
                                                   kmParams =
@@ -606,7 +617,7 @@ object BitcoinSWalletTest extends WalletLogger {
         chainQueryApi,
         bip39PasswordOpt)(config.walletConf, system)
       withBitcoind <- createWalletWithBitcoind(wallet, versionOpt)
-      funded <- fundWalletWithBitcoind(withBitcoind)
+      funded <- FundWalletUtil.fundWalletWithBitcoind(withBitcoind)
     } yield funded
   }
 
@@ -633,40 +644,14 @@ object BitcoinSWalletTest extends WalletLogger {
         chainQueryApi = chainQueryApi,
         bip39PasswordOpt = bip39PasswordOpt)(config.walletConf, system)
       //add callbacks for wallet
-      nodeCallbacks =
-        BitcoinSWalletTest.createNeutrinoNodeCallbacksForWallet(wallet)
+      nodeCallbacks <-
+        BitcoinSWalletTest.createNeutrinoNodeCallbacksForWallet(wallet)(
+          config.nodeConf,
+          system.dispatcher)
       _ = config.nodeConf.addCallbacks(nodeCallbacks)
       withBitcoind <- createWalletWithBitcoind(wallet, bitcoindRpcClient)
-      funded <- fundWalletWithBitcoind(withBitcoind)
+      funded <- FundWalletUtil.fundWalletWithBitcoind(withBitcoind)
     } yield funded
-  }
-
-  /** Funds the given wallet with money from the given bitcoind */
-  def fundWalletWithBitcoind[T <: WalletWithBitcoind](pair: T)(implicit
-      ec: ExecutionContext): Future[T] = {
-    val (wallet, bitcoind) = (pair.wallet, pair.bitcoind)
-
-    val defaultAccount = wallet.walletConfig.defaultAccount
-    val fundedDefaultAccountWalletF =
-      FundWalletUtil.fundAccountForWalletWithBitcoind(
-        amts = defaultAcctAmts,
-        account = defaultAccount,
-        wallet = wallet,
-        bitcoind = bitcoind
-      )
-
-    val hdAccount1 = WalletTestUtil.getHdAccount1(wallet.walletConfig)
-    val fundedAccount1WalletF = for {
-      fundedDefaultAcct <- fundedDefaultAccountWalletF
-      fundedAcct1 <- FundWalletUtil.fundAccountForWalletWithBitcoind(
-        amts = account1Amt,
-        account = hdAccount1,
-        wallet = fundedDefaultAcct,
-        bitcoind = bitcoind
-      )
-    } yield fundedAcct1
-
-    fundedAccount1WalletF.map(_ => pair)
   }
 
   def destroyWalletWithBitcoind(walletWithBitcoind: WalletWithBitcoind)(implicit
@@ -706,22 +691,9 @@ object BitcoinSWalletTest extends WalletLogger {
 
   /** Constructs callbacks for the wallet from the node to process blocks and compact filters */
   def createNeutrinoNodeCallbacksForWallet(wallet: Wallet)(implicit
-      ec: ExecutionContext): NodeCallbacks = {
-    val onBlock: OnBlockReceived = { block =>
-      for {
-        _ <- wallet.processBlock(block)
-      } yield ()
-    }
-    val onCompactFilters: OnCompactFiltersReceived = { blockFilters =>
-      for {
-        _ <- wallet.processCompactFilters(blockFilters)
-      } yield ()
-    }
-
-    NodeCallbacks(
-      onBlockReceived = Vector(onBlock),
-      onCompactFiltersReceived = Vector(onCompactFilters)
-    )
+      nodeAppConfig: NodeAppConfig,
+      ec: ExecutionContext): Future[NodeCallbacks] = {
+    CallbackUtil.createNeutrinoNodeCallbacksForWallet(wallet)
   }
 
   /** Registers a callback to handle merkle blocks given to us by a spv node */

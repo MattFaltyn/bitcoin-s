@@ -355,7 +355,7 @@ trait TLVGen {
 
   def cetSignaturesV0TLV: Gen[CETSignaturesV0TLV] = {
     Gen
-      .listOf(CryptoGenerators.adaptorSignature)
+      .nonEmptyListOf(CryptoGenerators.adaptorSignature)
       .map(sigs => CETSignaturesV0TLV(sigs.toVector))
   }
 
@@ -403,6 +403,7 @@ trait TLVGen {
       }
 
       DLCOfferTLV(
+        protocolVersionOpt = None, //TODO: Comeback and change this
         contractFlags = 0.toByte,
         chainHash = chainHash,
         contractInfo = contractInfo,
@@ -427,8 +428,9 @@ trait TLVGen {
       offer <- dlcOfferTLV
       (oracleInfo, oraclePrivKey, oracleRValue) <- oracleInfoV0TLVWithKeys
     } yield {
-      (offer.copy(contractInfo =
-         offer.contractInfo.copy(oracleInfo = oracleInfo)),
+      (offer.copy(contractInfo = offer.contractInfo
+         .asInstanceOf[ContractInfoV0TLV]
+         .copy(oracleInfo = oracleInfo)),
        oraclePrivKey,
        oracleRValue)
     }

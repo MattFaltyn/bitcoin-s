@@ -1,12 +1,15 @@
 package org.bitcoins.wallet
 
-import org.bitcoins.core.currency.Satoshis
+import grizzled.slf4j.Logging
+import org.bitcoins.core.api.wallet.db.SpendingInfoDb
+import org.bitcoins.core.currency.{Bitcoins, Satoshis}
 import org.bitcoins.core.number._
 import org.bitcoins.core.protocol.BitcoinAddress
 import org.bitcoins.core.protocol.script._
 import org.bitcoins.core.protocol.transaction._
 import org.bitcoins.core.psbt.PSBT
-import org.bitcoins.core.wallet.fee.SatoshisPerByte
+import org.bitcoins.core.wallet.builder.RawTxSigner
+import org.bitcoins.core.wallet.fee.{SatoshisPerByte, SatoshisPerVirtualByte}
 import org.bitcoins.core.wallet.utxo.TxoState
 import org.bitcoins.core.wallet.utxo.TxoState._
 import org.bitcoins.crypto.ECPublicKey
@@ -19,7 +22,9 @@ import org.scalatest.{FutureOutcome, Outcome}
 
 import scala.concurrent.Future
 
-class UTXOLifeCycleTest extends BitcoinSWalletTestCachedBitcoindNewest {
+class UTXOLifeCycleTest
+    extends BitcoinSWalletTestCachedBitcoindNewest
+    with Logging {
 
   behavior of "Wallet Txo States"
 
@@ -314,7 +319,7 @@ class UTXOLifeCycleTest extends BitcoinSWalletTestCachedBitcoindNewest {
 
     for {
       oldTransactions <- wallet.listTransactions()
-      feeRate <- wallet.getFeeRate
+      feeRate <- wallet.getFeeRate()
       tx <- wallet.fundRawTransaction(Vector(dummyOutput),
                                       feeRate,
                                       fromTagOpt = None,
@@ -340,7 +345,7 @@ class UTXOLifeCycleTest extends BitcoinSWalletTestCachedBitcoindNewest {
 
       for {
         oldTransactions <- wallet.listTransactions()
-        feeRate <- wallet.getFeeRate
+        feeRate <- wallet.getFeeRate()
         tx <- wallet.fundRawTransaction(Vector(dummyOutput),
                                         feeRate,
                                         fromTagOpt = None,
@@ -370,7 +375,7 @@ class UTXOLifeCycleTest extends BitcoinSWalletTestCachedBitcoindNewest {
 
       for {
         oldTransactions <- wallet.listTransactions()
-        feeRate <- wallet.getFeeRate
+        feeRate <- wallet.getFeeRate()
         tx <- wallet.fundRawTransaction(Vector(dummyOutput),
                                         feeRate,
                                         fromTagOpt = None,
@@ -397,13 +402,20 @@ class UTXOLifeCycleTest extends BitcoinSWalletTestCachedBitcoindNewest {
       val dummyOutput =
         TransactionOutput(Satoshis(100000),
                           P2PKHScriptPubKey(ECPublicKey.freshPublicKey))
-
+      val accountF = wallet.getDefaultAccount()
       for {
         oldTransactions <- wallet.listTransactions()
-        tx <- wallet.sendToOutputs(Vector(dummyOutput), None)
-        _ <- wallet.processTransaction(tx, None)
-        _ <- wallet.markUTXOsAsReserved(tx)
-
+        account <- accountF
+        (txBuilder, params) <- wallet.fundRawTransactionInternal(
+          destinations = Vector(dummyOutput),
+          feeRate = SatoshisPerVirtualByte.one,
+          fromAccount = account,
+          fromTagOpt = None,
+          markAsReserved = true
+        )
+        builderResult = txBuilder.builder.result()
+        unsignedTx = txBuilder.finalizer.buildTx(builderResult)
+        tx = RawTxSigner.sign(unsignedTx, params)
         allReserved <- wallet.listUtxos(TxoState.Reserved)
         _ = assert(
           tx.inputs
@@ -470,6 +482,125 @@ class UTXOLifeCycleTest extends BitcoinSWalletTestCachedBitcoindNewest {
         assert(
           updatedCoins.forall(_.state == TxoState.PendingConfirmationsSpent))
         assert(updatedCoins.forall(_.spendingTxIdOpt.contains(tx.txIdBE)))
+      }
+  }
+
+  it must "fail to mark utxos as reserved if one of the utxos is already reserved" in {
+    param =>
+      val WalletWithBitcoindRpc(wallet, _) = param
+      val utxosF = wallet.listUtxos()
+
+      val reservedUtxoF: Future[SpendingInfoDb] = for {
+        utxos <- utxosF
+        first = utxos.head
+        //just reserve this one to start
+        reserved <- wallet.markUTXOsAsReserved(Vector(first))
+      } yield reserved.head
+
+      val reserveFailedF = for {
+        utxos <- utxosF
+        _ <- reservedUtxoF
+        //now try to reserve them all
+        //this should fail as the first utxo is reserved
+        _ <- wallet.markUTXOsAsReserved(utxos)
+      } yield ()
+
+      val assertionF = recoverToSucceededIf[RuntimeException](reserveFailedF)
+
+      for {
+        _ <- assertionF
+        reserved <- reservedUtxoF
+        utxos <- wallet.listUtxos(TxoState.Reserved)
+      } yield {
+        //make sure only 1 utxo is still reserved
+        assert(utxos.length == 1)
+        assert(reserved.outPoint == utxos.head.outPoint)
+      }
+  }
+
+  it must "mark a utxo as reserved that is still receiving confirmations and not unreserve the utxo" in {
+    param =>
+      val WalletWithBitcoindRpc(wallet, bitcoind) = param
+      val addressF = wallet.getNewAddress()
+      val txIdF =
+        addressF.flatMap(addr => bitcoind.sendToAddress(addr, Bitcoins.one))
+      val throwAwayAddrF = bitcoind.getNewAddress
+      for {
+        txId <- txIdF
+        //generate a few blocks to make the utxo pending confirmations received
+        throwAwayAddr <- throwAwayAddrF
+        hashes <- bitcoind.generateToAddress(blocks = 1, throwAwayAddr)
+        block <- bitcoind.getBlockRaw(hashes.head)
+        _ <- wallet.processBlock(block)
+
+        //make sure the utxo is pending confirmations received
+        utxos <- wallet.listUtxos(TxoState.PendingConfirmationsReceived)
+        _ = assert(utxos.length == 1)
+        utxo = utxos.head
+        _ = assert(utxo.txid == txId)
+        _ = assert(utxo.state == TxoState.PendingConfirmationsReceived)
+        //now mark the utxo as reserved
+        _ <- wallet.markUTXOsAsReserved(Vector(utxo))
+        //confirm it is reserved
+        _ <- wallet
+          .listUtxos(TxoState.Reserved)
+          .map(utxos =>
+            assert(utxos.contains(utxo.copyWithState(TxoState.Reserved))))
+
+        //now process another block
+        hashes2 <- bitcoind.generateToAddress(blocks = 1, throwAwayAddr)
+        block2 <- bitcoind.getBlockRaw(hashes2.head)
+        _ <- wallet.processBlock(block2)
+
+        //the utxo should still be reserved
+        reservedUtxos <- wallet.listUtxos(TxoState.Reserved)
+        reservedUtxo = reservedUtxos.head
+      } yield {
+        assert(reservedUtxo.txid == txId)
+        assert(reservedUtxo.state == TxoState.Reserved)
+      }
+  }
+
+  it must "transition a reserved utxo to spent when we are offline" in {
+    param =>
+      val WalletWithBitcoindRpc(wallet, bitcoind) = param
+      val bitcoindAddrF = bitcoind.getNewAddress
+      val amt = Satoshis(100000)
+      val utxoCountF = wallet.listUtxos()
+      for {
+        bitcoindAdr <- bitcoindAddrF
+        utxoCount <- utxoCountF
+        //build a spending transaction
+        tx <- wallet.sendToAddress(bitcoindAdr, amt, SatoshisPerVirtualByte.one)
+        c <- wallet.listUtxos()
+        _ = assert(c.length == utxoCount.length)
+        txIdBE <- bitcoind.sendRawTransaction(tx)
+
+        //find all utxos that we can use to fund a transaction
+        utxos <- wallet
+          .listUtxos()
+          .map(_.filter(u => TxoState.receivedStates.contains(u.state)))
+        broadcastReceived <- wallet.listUtxos(TxoState.BroadcastReceived)
+        _ = assert(broadcastReceived.length == 1) //change output
+
+        //mark all utxos as reserved
+        _ <- wallet.markUTXOsAsReserved(utxos)
+        newReservedUtxos <- wallet.listUtxos(TxoState.Reserved)
+
+        //make sure all utxos are reserved
+        _ = assert(newReservedUtxos.length == utxoCount.length)
+        blockHash <- bitcoind.generateToAddress(1, bitcoindAdr).map(_.head)
+        block <- bitcoind.getBlockRaw(blockHash)
+        _ <- wallet.processBlock(block)
+        broadcastSpentUtxo <- wallet.listUtxos(
+          TxoState.PendingConfirmationsSpent)
+        finalReservedUtxos <- wallet.listUtxos(TxoState.Reserved)
+      } yield {
+        assert(broadcastSpentUtxo.length == 1)
+        //make sure spendingTxId got set correctly
+        assert(broadcastSpentUtxo.head.spendingTxIdOpt.get == txIdBE)
+        //make sure no utxos get unreserved when processing the block
+        assert(finalReservedUtxos.length == newReservedUtxos.length)
       }
   }
 }

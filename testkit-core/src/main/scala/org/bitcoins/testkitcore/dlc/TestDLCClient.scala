@@ -15,7 +15,9 @@ import org.bitcoins.core.protocol.dlc.models.DLCMessage.DLCAccept
 import org.bitcoins.core.protocol.dlc.models._
 import org.bitcoins.core.protocol.dlc.sign.DLCTxSigner
 import org.bitcoins.core.protocol.script.ScriptPubKey
+import org.bitcoins.core.protocol.tlv.DLCOfferTLV
 import org.bitcoins.core.protocol.transaction.Transaction
+import org.bitcoins.core.psbt.InputPSBTRecord.PartialSignature
 import org.bitcoins.core.wallet.fee.SatoshisPerVirtualByte
 import org.bitcoins.core.wallet.utxo.{InputInfo, ScriptSignatureParams}
 import org.bitcoins.crypto._
@@ -64,16 +66,19 @@ case class TestDLCClient(
     * and FundingSignatures from them
     */
   def setupDLCAccept(
-      sendSigs: CETSignatures => Future[Unit],
-      getSigs: Future[(CETSignatures, FundingSignatures)]): Future[SetupDLC] = {
+      sendSigs: (CETSignatures, PartialSignature) => Future[Unit],
+      getSigs: Future[
+        (CETSignatures, PartialSignature, FundingSignatures)]): Future[
+    SetupDLC] = {
     require(!isInitiator, "You should call setupDLCOffer")
 
     for {
       (remoteCetSigs, cets) <- dlcTxSigner.createCETsAndCETSigsAsync()
-      _ <- sendSigs(remoteCetSigs)
-      (cetSigs, fundingSigs) <- getSigs
+      refundSig = dlcTxSigner.signRefundTx
+      _ <- sendSigs(remoteCetSigs, refundSig)
+      (cetSigs, refundSig, fundingSigs) <- getSigs
       setupDLC <- Future.fromTry {
-        dlcExecutor.setupDLCAccept(cetSigs, fundingSigs, Some(cets))
+        dlcExecutor.setupDLCAccept(cetSigs, refundSig, fundingSigs, Some(cets))
       }
     } yield {
       setupDLC
@@ -86,15 +91,18 @@ case class TestDLCClient(
     * signed funding transaction
     */
   def setupDLCOffer(
-      getSigs: Future[CETSignatures],
-      sendSigs: (CETSignatures, FundingSignatures) => Future[Unit],
+      getSigs: Future[(CETSignatures, PartialSignature)],
+      sendSigs: (
+          CETSignatures,
+          PartialSignature,
+          FundingSignatures) => Future[Unit],
       getFundingTx: Future[Transaction]): Future[SetupDLC] = {
     require(isInitiator, "You should call setupDLCAccept")
 
     for {
-      cetSigs <- getSigs
+      (cetSigs, refundSig) <- getSigs
       setupDLCWithoutFundingTxSigs <- Future.fromTry {
-        dlcExecutor.setupDLCOffer(cetSigs)
+        dlcExecutor.setupDLCOffer(cetSigs, refundSig)
       }
       cetSigs =
         dlcTxSigner.createCETSigs(setupDLCWithoutFundingTxSigs.cets.map {
@@ -103,7 +111,7 @@ case class TestDLCClient(
       localFundingSigs <- Future.fromTry {
         dlcTxSigner.signFundingTx()
       }
-      _ <- sendSigs(cetSigs, localFundingSigs)
+      _ <- sendSigs(cetSigs, dlcTxSigner.signRefundTx, localFundingSigs)
       fundingTx <- getFundingTx
     } yield {
       setupDLCWithoutFundingTxSigs.copy(fundingTx = fundingTx)
@@ -154,11 +162,21 @@ object TestDLCClient {
     )
 
     val remoteOutcomes: ContractInfo = {
-      val descriptor =
-        outcomes.contractDescriptor.flip((input + remoteInput).satoshis)
-      val pair =
-        ContractOraclePair.fromDescriptorOracle(descriptor, outcomes.oracleInfo)
-      outcomes.copy(contractOraclePair = pair)
+      val descriptors =
+        outcomes.contractDescriptors.map(_.flip((input + remoteInput).satoshis))
+
+      val contracts = descriptors.zip(outcomes.oracleInfos).map {
+        case (descriptor, oracleInfo) =>
+          val pair =
+            ContractOraclePair.fromDescriptorOracle(descriptor, oracleInfo)
+          SingleContractInfo(outcomes.totalCollateral, pair)
+      }
+
+      outcomes match {
+        case _: SingleContractInfo => contracts.head
+        case _: DisjointUnionContractInfo =>
+          DisjointUnionContractInfo(contracts)
+      }
     }
 
     val changeAddress = BitcoinAddress.fromScriptPubKey(changeSPK, network)
@@ -208,6 +226,7 @@ object TestDLCClient {
     }
 
     val offer = DLCMessage.DLCOffer(
+      protocolVersionOpt = DLCOfferTLV.currentVersionOpt,
       contractInfo = offerOutcomes,
       pubKeys = offerPubKeys,
       totalCollateral = offerInput.satoshis,
@@ -220,6 +239,13 @@ object TestDLCClient {
       timeouts = timeouts
     )
 
+    val negotiationFields = offerOutcomes match {
+      case _: SingleContractInfo => DLCAccept.NoNegotiationFields
+      case DisjointUnionContractInfo(contracts) =>
+        DLCAccept.NegotiationFieldsV2(
+          contracts.map(_ => DLCAccept.NoNegotiationFields))
+    }
+
     val accept = DLCMessage.DLCAcceptWithoutSigs(
       totalCollateral = acceptInput.satoshis,
       pubKeys = acceptPubKeys,
@@ -227,7 +253,7 @@ object TestDLCClient {
       changeAddress = acceptChangeAddress,
       payoutSerialId = acceptPayoutSerialId,
       changeSerialId = acceptChangeSerialId,
-      negotiationFields = DLCAccept.NoNegotiationFields,
+      negotiationFields = negotiationFields,
       tempContractId = offer.tempContractId
     )
 

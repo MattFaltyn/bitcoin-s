@@ -39,7 +39,7 @@ class FundTransactionHandlingTest
     fundedWallet: WalletWithBitcoind =>
       val wallet = fundedWallet.wallet
       for {
-        feeRate <- wallet.getFeeRate
+        feeRate <- wallet.getFeeRate()
         fundedTx <- wallet.fundRawTransaction(destinations =
                                                 Vector(destination),
                                               feeRate = feeRate,
@@ -60,7 +60,7 @@ class FundTransactionHandlingTest
       val newDestination = destination.copy(value = amt)
       val wallet = fundedWallet.wallet
       for {
-        feeRate <- wallet.getFeeRate
+        feeRate <- wallet.getFeeRate()
         fundedTx <- wallet.fundRawTransaction(destinations =
                                                 Vector(newDestination),
                                               feeRate = feeRate,
@@ -81,14 +81,15 @@ class FundTransactionHandlingTest
       val wallet = fundedWallet.wallet
 
       for {
-        feeRate <- wallet.getFeeRate
+        feeRate <- wallet.getFeeRate()
         fundedTx <- wallet.fundRawTransaction(destinations = destinations,
                                               feeRate = feeRate,
                                               fromTagOpt = None,
                                               markAsReserved = false)
       } yield {
-        assert(fundedTx.inputs.length == 1,
-               s"We should only need one input to fund this tx")
+        // Can be different depending on waste calculation
+        assert(fundedTx.inputs.length == 1 || fundedTx.inputs.length == 2,
+               s"We should only need one or two inputs to fund this tx")
 
         destinations.foreach(d => assert(fundedTx.outputs.contains(d)))
         assert(fundedTx.outputs.length == 6,
@@ -105,7 +106,7 @@ class FundTransactionHandlingTest
       val wallet = fundedWallet.wallet
 
       val fundedTxF = for {
-        feeRate <- wallet.getFeeRate
+        feeRate <- wallet.getFeeRate()
         fundedTx <- wallet.fundRawTransaction(destinations =
                                                 Vector(tooBigOutput),
                                               feeRate = feeRate,
@@ -126,7 +127,7 @@ class FundTransactionHandlingTest
       val wallet = fundedWallet.wallet
 
       val fundedTxF = for {
-        feeRate <- wallet.getFeeRate
+        feeRate <- wallet.getFeeRate()
         fundedTx <- wallet.fundRawTransaction(destinations =
                                                 Vector(tooBigOutput),
                                               feeRate = feeRate,
@@ -149,7 +150,7 @@ class FundTransactionHandlingTest
       val account1 = WalletTestUtil.getHdAccount1(wallet.walletConfig)
       val account1DbF = wallet.accountDAO.findByAccount(account1)
       for {
-        feeRate <- wallet.getFeeRate
+        feeRate <- wallet.getFeeRate()
         account1DbOpt <- account1DbF
         fundedTx <- wallet.fundRawTransaction(Vector(newDestination),
                                               feeRate,
@@ -170,7 +171,7 @@ class FundTransactionHandlingTest
       val account1 = WalletTestUtil.getHdAccount1(wallet.walletConfig)
       val account1DbF = wallet.accountDAO.findByAccount(account1)
       val fundedTxF = for {
-        feeRate <- wallet.getFeeRate
+        feeRate <- wallet.getFeeRate()
         account1DbOpt <- account1DbF
         fundedTx <- wallet.fundRawTransaction(Vector(newDestination),
                                               feeRate,
@@ -187,7 +188,7 @@ class FundTransactionHandlingTest
       val wallet = fundedWallet.wallet
       val bitcoind = fundedWallet.bitcoind
       val fundedTxF = for {
-        feeRate <- wallet.getFeeRate
+        feeRate <- wallet.getFeeRate()
         _ <- wallet.createNewAccount(wallet.keyManager.kmParams)
         accounts <- wallet.accountDAO.findAll()
         account2 = accounts.find(_.hdAccount.index == 2).get
@@ -214,7 +215,7 @@ class FundTransactionHandlingTest
     fundedWallet: WalletWithBitcoind =>
       val wallet = fundedWallet.wallet
       for {
-        feeRate <- wallet.getFeeRate
+        feeRate <- wallet.getFeeRate()
         fundedTx <- wallet.fundRawTransaction(destinations =
                                                 Vector(destination),
                                               feeRate = feeRate,
@@ -234,7 +235,7 @@ class FundTransactionHandlingTest
       tag: AddressTag): Future[Assertion] = {
     for {
       account <- wallet.getDefaultAccount()
-      feeRate <- wallet.getFeeRate
+      feeRate <- wallet.getFeeRate()
       taggedAddr <- wallet.getNewAddress(Vector(tag))
       _ <-
         wallet.sendToAddress(taggedAddr, destination.value * 2, Some(feeRate))

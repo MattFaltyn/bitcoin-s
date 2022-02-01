@@ -3,6 +3,7 @@ package org.bitcoins.commons.serializers
 import org.bitcoins.commons.jsonmodels._
 import org.bitcoins.commons.jsonmodels.bitcoind.RpcOpts.LabelPurpose
 import org.bitcoins.commons.jsonmodels.bitcoind._
+import org.bitcoins.commons.jsonmodels.clightning.CLightningJsonModels._
 import org.bitcoins.commons.jsonmodels.eclair._
 import org.bitcoins.commons.serializers.JsonSerializers._
 import org.bitcoins.core.config._
@@ -38,6 +39,8 @@ import org.bitcoins.core.script.crypto.HashType
 import org.bitcoins.core.wallet.fee.{BitcoinFeeUnit, SatoshisPerByte}
 import org.bitcoins.crypto._
 import play.api.libs.json._
+import ujson.{Num, Str, Value}
+import scodec.bits.ByteVector
 
 import java.io.File
 import java.net.{InetAddress, InetSocketAddress, URI}
@@ -745,8 +748,16 @@ object JsonReaders {
 
   implicit val msatReads: Reads[MilliSatoshis] = {
     Reads { jsValue: JsValue =>
-      SerializerUtil.processJsNumberBigInt(MilliSatoshis.apply)(jsValue)
-
+      SerializerUtil
+        .processJsNumberBigInt(MilliSatoshis.apply)(jsValue)
+        .orElse {
+          SerializerUtil.processJsString { str =>
+            require(str.endsWith("msat"))
+            val withoutUnit = str.dropRight(4)
+            val num = BigInt(withoutUnit)
+            MilliSatoshis(num)
+          }(jsValue)
+        }
     }
   }
 
@@ -806,16 +817,21 @@ object JsonReaders {
       SerializerUtil.processJsString(s => UnknownFeature(s.toInt))(jsValue)
     }
 
-  implicit val activatedFeatureReads: Reads[ActivatedFeature] =
+  implicit val featuresReads: Reads[Features] = {
     Reads { jsValue =>
       for {
-        feature <- (jsValue \ "name").validate[Feature]
-        support <- (jsValue \ "support").validate[FeatureSupport]
-      } yield ActivatedFeature(feature, support)
+        activatedObj <- (jsValue \ "activated")
+          .validate[Map[String, FeatureSupport]]
+        unknown <- (jsValue \ "unknown").validate[Set[UnknownFeature]]
+      } yield {
+        val activated = activatedObj.toSeq.map(x =>
+          ActivatedFeature(featuresByName(x._1), x._2))
+        Features(
+          activated = activated.toSet,
+          unknown = unknown
+        )
+      }
     }
-
-  implicit val featuresReads: Reads[Features] = {
-    Json.reads[Features]
   }
 
   implicit val getInfoResultReads: Reads[GetInfoResult] = {
@@ -844,21 +860,25 @@ object JsonReaders {
         rgbColor <- (jsValue \ "rgbColor").validate[String]
         alias <- (jsValue \ "alias").validate[String]
         addresses <- (jsValue \ "addresses").validate[Vector[InetSocketAddress]]
-        unknownFields <- (jsValue \ "unknownFields").validate[String]
       } yield NodeInfo(signature,
                        features,
                        timestamp,
                        nodeId,
                        rgbColor,
                        alias,
-                       addresses,
-                       unknownFields)
+                       addresses)
     }
   }
 
   implicit val paymentPreimageReads: Reads[PaymentPreimage] = {
     Reads { jsValue: JsValue =>
       SerializerUtil.processJsString(PaymentPreimage.fromHex)(jsValue)
+    }
+  }
+
+  implicit val paymentSecretReads: Reads[PaymentSecret] = {
+    Reads { jsValue: JsValue =>
+      SerializerUtil.processJsString(PaymentSecret.fromHex)(jsValue)
     }
   }
 
@@ -992,6 +1012,9 @@ object JsonReaders {
         SerializerUtil.buildJsErrorMsg("jsobject", err)
     }
 
+  implicit val channelFlagsReads: Reads[ChannelFlags] =
+    Json.reads[ChannelFlags]
+
   implicit val channelUpdateReads: Reads[ChannelUpdate] = {
     Reads { jsValue =>
       for {
@@ -1000,8 +1023,7 @@ object JsonReaders {
         shortChannelId <- (jsValue \ "shortChannelId").validate[ShortChannelId]
         timestamp <- (jsValue \ "timestamp")
           .validate[Instant](instantReadsSeconds)
-        messageFlags <- (jsValue \ "messageFlags").validate[Int]
-        channelFlags <- (jsValue \ "channelFlags").validate[Int]
+        channelFlags <- (jsValue \ "channelFlags").validate[ChannelFlags]
         cltvExpiryDelta <- (jsValue \ "cltvExpiryDelta").validate[Int]
         htlcMinimumMsat <- (jsValue \ "htlcMinimumMsat").validate[MilliSatoshis]
         feeProportionalMillionths <- (jsValue \ "feeProportionalMillionths")
@@ -1014,7 +1036,6 @@ object JsonReaders {
         chainHash,
         shortChannelId,
         timestamp,
-        messageFlags,
         channelFlags,
         cltvExpiryDelta,
         htlcMinimumMsat,
@@ -1405,5 +1426,53 @@ object JsonReaders {
 
   implicit val walletTransactionReads: Reads[WalletTransaction] =
     Json.reads[WalletTransaction]
+
+  def jsToSatoshis(js: Value): Satoshis =
+    js match {
+      case str: Str =>
+        Satoshis(BigInt(str.value))
+      case num: Num =>
+        Satoshis(num.value.toLong)
+      case _: Value =>
+        throw Value.InvalidData(js, "Expected value in Satoshis")
+    }
+
+  implicit val byteVectorReads: Reads[ByteVector] = {
+    Reads { jsValue =>
+      SerializerUtil.processJsStringOpt(str => ByteVector.fromHex(str))(jsValue)
+    }
+  }
+
+  implicit val outputStatusReads: Reads[OutputStatus] = {
+    Reads { jsValue =>
+      SerializerUtil.processJsStringOpt(OutputStatus.fromStringOpt)(jsValue)
+    }
+  }
+
+  implicit val connectionDirectionReads: Reads[ConnectionDirection] = {
+    Reads { jsValue =>
+      SerializerUtil.processJsStringOpt(ConnectionDirection.fromStringOpt)(
+        jsValue)
+    }
+  }
+
+  implicit val localOrRemoteReads: Reads[LocalOrRemote] = {
+    Reads { jsValue =>
+      SerializerUtil.processJsStringOpt(LocalOrRemote.fromStringOpt)(jsValue)
+    }
+  }
+
+  implicit val invoiceStatusReads: Reads[InvoiceStatus] = {
+    Reads { jsValue =>
+      SerializerUtil.processJsStringOpt(InvoiceStatus.fromStringOpt)(jsValue)
+    }
+  }
+
+  implicit val closedChannelTypeReads: Reads[ClosedChannelType] = {
+    Reads { jsValue =>
+      SerializerUtil.processJsStringOpt(ClosedChannelType.fromStringOpt)(
+        jsValue)
+    }
+  }
 
 }

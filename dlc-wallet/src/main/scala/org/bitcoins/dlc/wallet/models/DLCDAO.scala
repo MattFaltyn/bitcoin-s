@@ -4,6 +4,7 @@ import org.bitcoins.core.api.dlc.wallet.db.DLCDb
 import org.bitcoins.core.hd.{HDAccount, HDChainType}
 import org.bitcoins.core.number.UInt64
 import org.bitcoins.core.protocol.dlc.models.DLCState
+import org.bitcoins.core.protocol.tlv.DLCSerializationVersion
 import org.bitcoins.core.protocol.transaction.TransactionOutPoint
 import org.bitcoins.core.wallet.fee.SatoshisPerVirtualByte
 import org.bitcoins.crypto._
@@ -16,10 +17,11 @@ import java.time.Instant
 import scala.concurrent.{ExecutionContext, Future}
 
 case class DLCDAO()(implicit
-    val ec: ExecutionContext,
+    override val ec: ExecutionContext,
     override val appConfig: DLCAppConfig)
     extends CRUD[DLCDb, Sha256Digest]
-    with SlickUtil[DLCDb, Sha256Digest] {
+    with SlickUtil[DLCDb, Sha256Digest]
+    with DLCIdDaoUtil[DLCDb, Sha256Digest] {
   private val mappers = new org.bitcoins.db.DbCommonsColumnMappers(profile)
   import mappers._
   import profile.api._
@@ -42,9 +44,25 @@ case class DLCDAO()(implicit
   override def findAll(dlcs: Vector[DLCDb]): Query[DLCTable, DLCDb, Seq] =
     findByPrimaryKeys(dlcs.map(_.dlcId))
 
-  def deleteByDLCId(dlcId: Sha256Digest): Future[Int] = {
+  override def findByDLCIdsAction(dlcIds: Vector[Sha256Digest]): DBIOAction[
+    Vector[DLCDb],
+    profile.api.NoStream,
+    profile.api.Effect.Read] = {
+    val q = table.filter(_.dlcId.inSet(dlcIds))
+    q.result.map(_.toVector)
+  }
+
+  override def deleteByDLCIdAction(dlcId: Sha256Digest): DBIOAction[
+    Int,
+    profile.api.NoStream,
+    profile.api.Effect.Write] = {
     val q = table.filter(_.dlcId === dlcId)
-    safeDatabase.run(q.delete)
+    q.delete
+  }
+
+  def findByDLCIds(dlcIds: Vector[Sha256Digest]): Future[Vector[DLCDb]] = {
+    val action = table.filter(_.dlcId.inSet(dlcIds)).result
+    safeDatabase.runVec(action)
   }
 
   def findByTempContractId(
@@ -77,20 +95,6 @@ case class DLCDAO()(implicit
       case dlcs: Vector[DLCDb] =>
         throw new RuntimeException(
           s"More than one DLC per contractId (${contractId.toHex}), got: $dlcs")
-    }
-  }
-
-  def findByDLCId(dlcId: Sha256Digest): Future[Option[DLCDb]] = {
-    val q = table.filter(_.dlcId === dlcId)
-
-    safeDatabase.run(q.result).map {
-      case h +: Vector() =>
-        Some(h)
-      case Vector() =>
-        None
-      case dlcs: Vector[DLCDb] =>
-        throw new RuntimeException(
-          s"More than one DLC per dlcId (${dlcId.hex}), got: $dlcs")
     }
   }
 
@@ -155,7 +159,10 @@ case class DLCDAO()(implicit
     def aggregateSignatureOpt: Rep[Option[SchnorrDigitalSignature]] = column(
       "aggregate_signature")
 
-    def * : ProvenShape[DLCDb] =
+    def serializationVersion: Rep[DLCSerializationVersion] = column(
+      "serialization_version")
+
+    override def * : ProvenShape[DLCDb] =
       (dlcId,
        tempContractId,
        contractId,
@@ -171,6 +178,7 @@ case class DLCDAO()(implicit
        fundingOutPointOpt,
        fundingTxIdOpt,
        closingTxIdOpt,
-       aggregateSignatureOpt).<>(DLCDb.tupled, DLCDb.unapply)
+       aggregateSignatureOpt,
+       serializationVersion).<>(DLCDb.tupled, DLCDb.unapply)
   }
 }

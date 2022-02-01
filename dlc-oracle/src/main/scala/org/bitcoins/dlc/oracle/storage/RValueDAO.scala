@@ -10,7 +10,7 @@ import slick.lifted.ProvenShape
 import scala.concurrent.{ExecutionContext, Future}
 
 case class RValueDAO()(implicit
-    val ec: ExecutionContext,
+    override val ec: ExecutionContext,
     override val appConfig: DLCOracleAppConfig)
     extends CRUD[RValueDb, SchnorrNonce]
     with SlickUtil[RValueDb, SchnorrNonce] {
@@ -33,6 +33,16 @@ case class RValueDAO()(implicit
   override protected def findAll(
       ts: Vector[RValueDb]): Query[RValueTable, RValueDb, Seq] =
     findByPrimaryKeys(ts.map(_.nonce))
+
+  def findByNonce(nonce: SchnorrNonce): Future[Option[RValueDb]] = {
+    findByNonces(Vector(nonce))
+      .map(_.headOption)
+  }
+
+  def findByNonces(nonces: Vector[SchnorrNonce]): Future[Vector[RValueDb]] = {
+    val action = table.filter(_.nonce.inSet(nonces)).result.transactionally
+    safeDatabase.runVec(action)
+  }
 
   def maxKeyIndex: Future[Option[Int]] = {
     val query = table.map(_.keyIndex).max

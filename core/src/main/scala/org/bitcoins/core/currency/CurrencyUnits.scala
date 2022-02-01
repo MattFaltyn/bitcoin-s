@@ -140,7 +140,9 @@ object Satoshis
 sealed abstract class Bitcoins extends CurrencyUnit {
   override type A = BigDecimal
 
-  override def toString: String = s"$toBigDecimal BTC"
+  override def toString: String = s"$decimalString BTC"
+
+  def decimalString: String = "%.8f".format(toBigDecimal)
 
   override def toBigDecimal: BigDecimal = underlying
 
@@ -149,6 +151,11 @@ sealed abstract class Bitcoins extends CurrencyUnit {
   override def satoshis: Satoshis = {
     val sat = underlying * CurrencyUnits.btcToSatoshiScalar
     Satoshis(sat.toLongExact)
+  }
+
+  def satoshisRounded: Satoshis = {
+    val sat = underlying * CurrencyUnits.btcToSatoshiScalar
+    Satoshis(sat.toLong)
   }
 }
 

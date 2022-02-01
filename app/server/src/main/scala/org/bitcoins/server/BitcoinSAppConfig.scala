@@ -4,11 +4,10 @@ import akka.actor.ActorSystem
 import com.typesafe.config.{Config, ConfigFactory}
 import grizzled.slf4j.Logging
 import org.bitcoins.chain.config.ChainAppConfig
-import org.bitcoins.commons.config.AppConfig
-import org.bitcoins.commons.file.FileUtil
+import org.bitcoins.commons.config.{AppConfig, ConfigOps}
 import org.bitcoins.commons.util.ServerArgParser
 import org.bitcoins.core.config.NetworkParameters
-import org.bitcoins.core.util.{FutureUtil, StartStopAsync}
+import org.bitcoins.core.util.{StartStopAsync, TimeUtil}
 import org.bitcoins.dlc.node.config.DLCNodeAppConfig
 import org.bitcoins.dlc.wallet.DLCAppConfig
 import org.bitcoins.keymanager.config.KeyManagerAppConfig
@@ -18,7 +17,9 @@ import org.bitcoins.tor.config.TorAppConfig
 import org.bitcoins.wallet.config.WalletAppConfig
 
 import java.nio.file.{Files, Path, Paths}
+import java.util.concurrent.TimeUnit
 import scala.concurrent.Future
+import scala.concurrent.duration.{DurationInt, FiniteDuration}
 
 /** A unified config class for all submodules of Bitcoin-S
   * that accepts configuration. Thanks to implicit definitions
@@ -30,43 +31,64 @@ import scala.concurrent.Future
   * @param confs A sequence of optional configuration overrides
   */
 case class BitcoinSAppConfig(
-    private val directory: Path,
-    private val confs: Config*)(implicit system: ActorSystem)
-    extends StartStopAsync[Unit] {
+    baseDatadir: Path,
+    configOverrides: Vector[Config])(implicit system: ActorSystem)
+    extends StartStopAsync[Unit]
+    with Logging {
   import system.dispatcher
-  lazy val walletConf: WalletAppConfig = WalletAppConfig(directory, confs: _*)
-  lazy val nodeConf: NodeAppConfig = NodeAppConfig(directory, confs: _*)
-  lazy val chainConf: ChainAppConfig = ChainAppConfig(directory, confs: _*)
-  lazy val dlcConf: DLCAppConfig = DLCAppConfig(directory, confs: _*)
-  lazy val torConf: TorAppConfig = TorAppConfig(directory, confs: _*)
+
+  lazy val walletConf: WalletAppConfig =
+    WalletAppConfig(baseDatadir, configOverrides)
+  lazy val nodeConf: NodeAppConfig = NodeAppConfig(baseDatadir, configOverrides)
+
+  lazy val chainConf: ChainAppConfig =
+    ChainAppConfig(baseDatadir, configOverrides)
+  lazy val dlcConf: DLCAppConfig = DLCAppConfig(baseDatadir, configOverrides)
+
+  lazy val torConf: TorAppConfig =
+    TorAppConfig(baseDatadir, None, configOverrides)
 
   lazy val dlcNodeConf: DLCNodeAppConfig =
-    DLCNodeAppConfig(directory, confs: _*)
+    DLCNodeAppConfig(baseDatadir, configOverrides)
 
   def copyWithConfig(newConfs: Vector[Config]): BitcoinSAppConfig = {
-    val configs = newConfs ++ confs
-    BitcoinSAppConfig(directory, configs: _*)
+    val configs = newConfs ++ configOverrides
+    BitcoinSAppConfig(baseDatadir, configs)
   }
 
   lazy val kmConf: KeyManagerAppConfig =
-    KeyManagerAppConfig(directory, confs: _*)
+    KeyManagerAppConfig(baseDatadir, configOverrides)
 
   lazy val bitcoindRpcConf: BitcoindRpcAppConfig =
-    BitcoindRpcAppConfig(directory, confs: _*)
+    BitcoindRpcAppConfig(baseDatadir, configOverrides)
 
   lazy val network: NetworkParameters = chainConf.network
 
   /** Initializes the wallet, node and chain projects */
   override def start(): Future[Unit] = {
-    val configs = List(kmConf,
-                       walletConf,
-                       torConf,
-                       nodeConf,
-                       chainConf,
-                       bitcoindRpcConf,
-                       dlcConf)
+    val start = TimeUtil.currentEpochMs
+    //configurations that don't depend on tor startup
+    //start these in parallel as an optimization
+    val nonTorConfigs = Vector(kmConf, chainConf, walletConf)
 
-    FutureUtil.sequentially(configs)(_.start()).map(_ => ())
+    val torConfig = torConf.start()
+    val torDependentConfigs = Vector(nodeConf, bitcoindRpcConf, dlcConf)
+
+    val startedTorDependentConfigsF = for {
+      _ <- torConfig
+      _ <- Future.sequence(torDependentConfigs.map(_.start()))
+    } yield ()
+
+    val startedNonTorConfigs = Future.sequence(nonTorConfigs.map(_.start()))
+
+    for {
+      _ <- startedNonTorConfigs
+      _ <- startedTorDependentConfigsF
+    } yield {
+      logger.info(
+        s"Done starting BitcoinSAppConfig, it took=${TimeUtil.currentEpochMs - start}ms")
+      ()
+    }
   }
 
   override def stop(): Future[Unit] = {
@@ -82,7 +104,7 @@ case class BitcoinSAppConfig(
   /** The underlying config the result of our fields derive from */
   lazy val config: Config = {
     val finalConfig =
-      AppConfig.getBaseConfig(baseDatadir = directory, confs.toList)
+      AppConfig.getBaseConfig(baseDatadir = baseDatadir, configOverrides)
     val resolved = finalConfig.resolve()
 
     resolved.checkValid(ConfigFactory.defaultReference(), "bitcoin-s")
@@ -92,6 +114,25 @@ case class BitcoinSAppConfig(
 
   def rpcPort: Int = config.getInt("bitcoin-s.server.rpcport")
 
+  def wsPort: Int = config.getIntOrElse("bitcoin-s.server.wsport", 19999)
+
+  /** How long until we forcefully terminate connections to the server
+    * when shutting down the server
+    */
+  def terminationDeadline: FiniteDuration = {
+    val opt = config.getDurationOpt("bitcoin-s.server.termination-deadline")
+    opt match {
+      case Some(duration) =>
+        if (duration.isFinite) {
+          new FiniteDuration(duration.toNanos, TimeUnit.NANOSECONDS)
+        } else {
+          sys.error(
+            s"Can only have a finite duration for termination deadline, got=$duration")
+        }
+      case None => 5.seconds //5 seconds by default
+    }
+  }
+
   def rpcBindOpt: Option[String] = {
     if (config.hasPath("bitcoin-s.server.rpcbind")) {
       Some(config.getString("bitcoin-s.server.rpcbind"))
@@ -100,25 +141,22 @@ case class BitcoinSAppConfig(
     }
   }
 
+  def wsBindOpt: Option[String] = {
+    if (config.hasPath("bitcoin-s.server.wsbind")) {
+      Some(config.getString("bitcoin-s.server.wsbind"))
+    } else {
+      None
+    }
+  }
+
+  def rpcPassword: String = config.getString("bitcoin-s.server.password")
+
   def exists(): Boolean = {
-    directory.resolve("bitcoin-s.conf").toFile.isFile
+    baseDatadir.resolve("bitcoin-s.conf").toFile.isFile
   }
 
-  def withOverrides(configs: Config*): BitcoinSAppConfig = {
-    BitcoinSAppConfig(directory, configs ++ confs: _*)
-  }
-
-  /** Zips $HOME/.bitcoin-s
-    */
-  def zipDatadir(target: Path): Path = {
-    FileUtil.zipDirectory(
-      source = directory,
-      target = target,
-      // we don't want to store chaindb.sqlite as these databases are huge
-      // skip logs and binaries as these can be large as well
-      fileNameFilter =
-        Vector(".*chaindb.sqlite$".r, ".*bitcoin-s.log$".r, ".*/binaries/.*".r)
-    )
+  def withOverrides(configs: Vector[Config]): BitcoinSAppConfig = {
+    BitcoinSAppConfig(baseDatadir, configs ++ configOverrides)
   }
 }
 
@@ -130,7 +168,7 @@ object BitcoinSAppConfig extends Logging {
   def fromConfig(config: Config)(implicit
       system: ActorSystem): BitcoinSAppConfig = {
     val configDataDir: Path = Paths.get(config.getString("bitcoin-s.datadir"))
-    BitcoinSAppConfig(configDataDir, config)
+    BitcoinSAppConfig(configDataDir, Vector(config))
   }
 
   def fromClassPathConfig()(implicit system: ActorSystem): BitcoinSAppConfig = {
@@ -139,7 +177,7 @@ object BitcoinSAppConfig extends Logging {
 
   def fromDatadir(datadir: Path, confs: Config*)(implicit
       system: ActorSystem): BitcoinSAppConfig = {
-    BitcoinSAppConfig(datadir, confs: _*)
+    BitcoinSAppConfig(datadir, confs.toVector)
   }
 
   def fromDatadirWithServerArgs(
@@ -154,7 +192,7 @@ object BitcoinSAppConfig extends Logging {
     */
   def fromDefaultDatadir(confs: Config*)(implicit
       system: ActorSystem): BitcoinSAppConfig =
-    BitcoinSAppConfig(AppConfig.DEFAULT_BITCOIN_S_DATADIR, confs: _*)
+    BitcoinSAppConfig(AppConfig.DEFAULT_BITCOIN_S_DATADIR, confs.toVector)
 
   def fromDefaultDatadirWithBundleConf(confs: Vector[Config] = Vector.empty)(
       implicit system: ActorSystem): BitcoinSAppConfig = {
@@ -221,5 +259,4 @@ object BitcoinSAppConfig extends Logging {
   def toBitcoindRpcConf(conf: BitcoinSAppConfig): BitcoindRpcAppConfig = {
     conf.bitcoindRpcConf
   }
-
 }

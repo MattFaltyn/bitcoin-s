@@ -16,13 +16,12 @@ class BitcoinSServerMainBitcoindTorTest
     config: BitcoinSAppConfig =>
       val server = new BitcoinSServerMain(ServerArgParser.empty)(system, config)
 
-      val cliConfig: Config = Config(rpcPortOpt = Some(config.rpcPort))
+      val cliConfig = Config(rpcPortOpt = Some(config.rpcPort),
+                             rpcPassword = config.rpcPassword)
 
       for {
         _ <- torF
         _ <- server.start()
-        // Await RPC server started
-        _ <- BitcoinSServer.startedF
 
         info = ConsoleCli.exec(CliCommand.WalletInfo, cliConfig)
         balance = ConsoleCli.exec(CliCommand.GetBalance(isSats = true),
@@ -33,14 +32,9 @@ class BitcoinSServerMainBitcoindTorTest
       } yield {
         assert(info.isSuccess)
         assert(balance.isSuccess)
-        assert(balance.get == "0 sats")
+        assert(balance.get == "0")
         assert(addr.isSuccess)
         assert(blockHash.isSuccess)
       }
-  }
-
-  override def afterAll(): Unit = {
-    super.afterAll()
-    BitcoinSServer.reset()
   }
 }

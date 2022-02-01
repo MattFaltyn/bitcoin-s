@@ -5,16 +5,20 @@ import org.bitcoins.core.crypto.{
   WitnessTxSigComponentP2SH,
   WitnessTxSigComponentRaw
 }
-import org.bitcoins.core.currency.CurrencyUnits
+import org.bitcoins.core.currency.{Bitcoins, CurrencyUnits}
 import org.bitcoins.core.number.UInt32
 import org.bitcoins.core.protocol.script._
 import org.bitcoins.core.protocol.transaction.testprotocol.CoreTransactionTestCase
 import org.bitcoins.core.script.PreExecutionScriptProgram
 import org.bitcoins.core.script.interpreter.ScriptInterpreter
 import org.bitcoins.core.script.result.ScriptOk
-import org.bitcoins.crypto.CryptoUtil
+import org.bitcoins.crypto.{CryptoUtil, ECPublicKey}
 import org.bitcoins.testkitcore.gen.TransactionGenerators
-import org.bitcoins.testkitcore.util.{BitcoinSUnitTest, TestUtil}
+import org.bitcoins.testkitcore.util.{
+  BitcoinSUnitTest,
+  TestUtil,
+  TransactionTestUtil
+}
 import scodec.bits._
 
 class TransactionTest extends BitcoinSUnitTest {
@@ -306,6 +310,73 @@ class TransactionTest extends BitcoinSUnitTest {
       "0200000002924942b0b7c12ece0dc8100d74a1cd29acd6cfc60698bfc3f07d83890eec20b6000000006a47304402202831d3708867f9bfb4268690cbcf97a686ccec1f5a4334cf0256fd442a88d0b802206fa8fa5550df8bfcc9c31cc8b6aad035be68b767b67e2b823f844680a79349650121038991058ce7ef4b00194e8426e3630dffd32822f819c150938f26113ba751c9a100000000924942b0b7c12ece0dc8100d74a1cd29acd6cfc60698bfc3f07d83890eec20b6010000006a47304402202e4cf01174afb9f97b0ab8f24c64c796ae4b3bb91d1838099bf262e8842e6480022006399d769d6d4ba099c2d3188f62caa5b51f572e7c2775a9bc23495c020dd1090121038991058ce7ef4b00194e8426e3630dffd32822f819c150938f26113ba751c9a1000000000288130000000000001976a914cc1fe3e943bd91e0e263f08a93f0d2a5299a7e5e88ac32600000000000001976a914af84620f44464d1a404386485885d1cd9e5d396d88ac00000000"
     val btx = BaseTransaction.fromHex(hex)
     ScriptInterpreter.checkTransaction(btx) must be(true)
+  }
+
+  it must "construct a base transaction that pays to a taproot address" in {
+    val output = TransactionOutput(Bitcoins.one,
+                                   TransactionTestUtil.bech32mAddr.scriptPubKey)
+    val btx = BaseTransaction(
+      TransactionConstants.validLockVersion,
+      Vector(
+        TransactionInput(EmptyTransactionOutPoint,
+                         ScriptSignature.empty,
+                         UInt32.max)),
+      Vector(output),
+      TransactionConstants.lockTime
+    )
+    assert(BaseTransaction.fromHex(btx.hex) == btx)
+  }
+
+  it must "construct a witness transaction that pays to a taproot address" in {
+    val output = TransactionOutput(Bitcoins.one,
+                                   TransactionTestUtil.bech32mAddr.scriptPubKey)
+    val inputs: Vector[TransactionInput] = Vector(
+      TransactionInput(EmptyTransactionOutPoint,
+                       ScriptSignature.empty,
+                       UInt32.max))
+
+    val pubKeyWit = ECPublicKey.freshPublicKey
+    val p2WPKHWitnessV0 = P2WPKHWitnessV0(pubKeyWit)
+    val witness: TransactionWitness =
+      TransactionWitness(Vector(p2WPKHWitnessV0))
+    val wtx = WitnessTransaction(
+      TransactionConstants.validLockVersion,
+      inputs,
+      Vector(output),
+      TransactionConstants.lockTime,
+      witness
+    )
+    assert(WitnessTransaction.fromHex(wtx.hex) == wtx)
+  }
+
+  it must "parse 66cc4de192001d970244ffe32896282a1994fef80f01d35b216033aeacac1651" in {
+    val hex =
+      "01000000000101d498f5f6e3a4f04e88170c4dfaa8acef0cf9b949086c15e23d75d98a5d516ec50000000000ffffffff02b6ca050000000000225120af68875a973914dd815fff548a9104eeb9e44bee55b2b1a7428bab71ef33bd362b0103000000000017a914f92c8425eb54c3ef38e507a786297d2648441c0e87" +
+        "014104720fcb29324a375b02b26c30cd45526dc7bdf668a59a4340f8bcf89275fafac91d0f763945373d17210650d717f5a1c465046c44c0ba2da74d6a76f61d1c370100000000"
+    val tx = Transaction.fromHex(hex)
+    assert(
+      tx.txIdBE.hex == "66cc4de192001d970244ffe32896282a1994fef80f01d35b216033aeacac1651")
+    assert(tx.hex == hex)
+  }
+
+  it must "parse e597ad88c1366e53743ac201d0156abda38cde9720b80baf7328ce9fa677772d" in {
+    val hex =
+      "02000000000102d003fe1e06554e70a8e6a7026407c54f9ad1c3ca29a5486fd9825c74534cf338070000006a47304402200fa8b5e8d4b32aaf060ceb1de381d2cb9481b95591ac086f548869dabe2b625402207e347389e0a92f48c3f7fd3f4ae0e05878c7fa55584941dec3f347fa9c87ea8c0121039766e910a95b9be9b6504bfc1585c1c739a295f29099c9ee20d8fd91f58191bfffffffff22c93527a49ee479e05fb00023430f519402ee70c1d1871c5df0f896be70bb1f0000000000ffffffff02fd423800000000001976a91425ff4d7161289d9950d332a93b226abf429ff97188ac62060000000000001600144b109941eba2e10e5feb034342e9124c9edf9d310002473044022034b207e3008680ca7e3785d1a4fcbbd4f167ee8dad86a506ef886928f5072ce3022055647f8a2352e1c09fd9127fffc91c7918f90c5a8870e07760a744a4412df701012102dfac2fa93040d21e83c98f3b2d6b0a1dc95921c301118a6597e373d5ba6bc08300000000"
+    val tx = Transaction.fromHex(hex)
+    assert(
+      tx.txIdBE.hex == "e597ad88c1366e53743ac201d0156abda38cde9720b80baf7328ce9fa677772d")
+    assert(tx.hex == hex)
+  }
+
+  it must "parse 37d5ec4bca7bd077992a6dd8679ab676a22986e63ebaf2c6ea1aebe5e5f5e817" in {
+    //has an invalid x coordinate in the wit v1 spk
+    //https://blockstream.info/tx/37d5ec4bca7bd077992a6dd8679ab676a22986e63ebaf2c6ea1aebe5e5f5e817
+
+    val hex =
+      "0100000001a76e1bb0e40d989cf3613c5b73bff552adaa09bdf79264cc0c44b968502db3be01000000fdfd000047304402200b0e9309480146ed5923a14cb3cd607facf9cf7b4f51ac9d448e0c8c3030aa5602201850641a5dd1c002e6ed9b723404a069a002608f45f77af1e3eb96e911d17afd01483045022100c7063f26164395e0ac8127b827cf6ad6a472fa8516197ef9ff565d7465b08dff022073329ded25b9559ce0dfef313ed084f9e294da47ddc814d2eab8839a8a4a9f16014c69522102b09c72ee2fa77abc24613b227d1cb6944c70af7f96711d5f1c4675daaa7554d221029787faf77569cdc59db5a34e0e9f552b9950b61d593e797ae12ac1d69eb5f98821022e9df5da07c71f7e8f5f639a28900d967714f2ae72b096c69c93fd76837b01a753aeffffffff02204e000000000000225120658204033e46a1fa8cceb84013cfe2d376ca72d5f595319497b95b08aa64a97014be00000000000017a914d06f57927ef98f7dfd25e9abdf5de65e1e7215698700000000"
+    val btx = BaseTransaction.fromHex(hex)
+    val spk = btx.outputs(0).scriptPubKey
+    assert(spk.isInstanceOf[UnassignedWitnessScriptPubKey])
   }
 
   private def findInput(

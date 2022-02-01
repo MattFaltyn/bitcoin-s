@@ -10,7 +10,7 @@ import scala.concurrent.{ExecutionContext, Future}
 case class OracleNoncePrimaryKey(announcementId: Long, index: Long)
 
 case class OracleNonceDAO()(implicit
-    val ec: ExecutionContext,
+    override val ec: ExecutionContext,
     override val appConfig: DLCAppConfig)
     extends CRUD[OracleNonceDb, OracleNoncePrimaryKey]
     with SlickUtil[OracleNonceDb, OracleNoncePrimaryKey] {
@@ -69,11 +69,18 @@ case class OracleNonceDAO()(implicit
     findByNonces(Vector(nonce)).map(_.headOption)
   }
 
+  def findByNoncesAction(nonces: Vector[SchnorrNonce]): DBIOAction[
+    Vector[OracleNonceDb],
+    NoStream,
+    Effect.Read] = {
+    val query = table.filter(_.nonce.inSet(nonces))
+    query.result.map(_.toVector)
+  }
+
   def findByNonces(
       nonces: Vector[SchnorrNonce]): Future[Vector[OracleNonceDb]] = {
-    val query = table.filter(_.nonce.inSet(nonces))
-
-    safeDatabase.runVec(query.result)
+    val action = findByNoncesAction(nonces)
+    safeDatabase.runVec(action)
   }
 
   def findByAnnouncementId(id: Long): Future[Vector[OracleNonceDb]] = {

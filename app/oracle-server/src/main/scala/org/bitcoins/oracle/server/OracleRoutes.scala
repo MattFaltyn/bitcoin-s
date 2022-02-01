@@ -20,7 +20,7 @@ case class OracleRoutes(oracle: DLCOracleApi)(implicit
     extends ServerRoute {
   import system.dispatcher
 
-  def handleCommand: PartialFunction[ServerCommand, StandardRoute] = {
+  override def handleCommand: PartialFunction[ServerCommand, StandardRoute] = {
     case ServerCommand("getpublickey", _) =>
       complete {
         Server.httpSuccess(oracle.publicKey().hex)
@@ -33,7 +33,9 @@ case class OracleRoutes(oracle: DLCOracleApi)(implicit
         Server.httpSuccess(address.toString)
       }
 
-    case ServerCommand("listevents", _) =>
+    case ServerCommand("listevents", arr) =>
+      handleCommand(ServerCommand("listannouncements", arr))
+    case ServerCommand("listannouncements", _) =>
       complete {
         oracle.listEvents().map { events =>
           val strs = events.map(_.eventName)
@@ -44,30 +46,34 @@ case class OracleRoutes(oracle: DLCOracleApi)(implicit
       }
 
     case ServerCommand("createenumevent", arr) =>
-      CreateEvent.fromJsArr(arr) match {
+      handleCommand(ServerCommand("createenumannouncement", arr))
+
+    case ServerCommand("createenumannouncement", arr) =>
+      CreateAnnouncement.fromJsArr(arr) match {
         case Failure(exception) =>
           reject(ValidationRejection("failure", Some(exception)))
-        case Success(CreateEvent(label, maturationTime, outcomes)) =>
+        case Success(CreateAnnouncement(label, maturationTime, outcomes)) =>
           complete {
             oracle
-              .createNewEnumEvent(label, maturationTime, outcomes)
+              .createNewEnumAnnouncement(label, maturationTime, outcomes)
               .map { announcementTLV =>
                 Server.httpSuccess(announcementTLV.hex)
               }
           }
       }
-
     case ServerCommand("createnumericevent", arr) =>
-      CreateNumericEvent.fromJsArr(arr) match {
+      handleCommand(ServerCommand("createnumericannouncement", arr))
+    case ServerCommand("createnumericannouncement", arr) =>
+      CreateNumericAnnouncement.fromJsArr(arr) match {
         case Failure(exception) =>
           reject(ValidationRejection("failure", Some(exception)))
         case Success(
-              CreateNumericEvent(eventName,
-                                 maturationTime,
-                                 minValue,
-                                 maxValue,
-                                 unit,
-                                 precision)) =>
+              CreateNumericAnnouncement(eventName,
+                                        maturationTime,
+                                        minValue,
+                                        maxValue,
+                                        unit,
+                                        precision)) =>
           complete {
 
             val isSigned = minValue < 0
@@ -75,13 +81,13 @@ case class OracleRoutes(oracle: DLCOracleApi)(implicit
               Math.ceil(Math.log(maxValue.toDouble) / Math.log(2)).toInt
 
             oracle
-              .createNewDigitDecompEvent(eventName,
-                                         maturationTime,
-                                         UInt16(2),
-                                         isSigned,
-                                         numDigits,
-                                         unit,
-                                         Int32(precision))
+              .createNewDigitDecompAnnouncement(eventName,
+                                                maturationTime,
+                                                UInt16(2),
+                                                isSigned,
+                                                numDigits,
+                                                unit,
+                                                Int32(precision))
               .map { announcementTLV =>
                 Server.httpSuccess(announcementTLV.hex)
               }
@@ -89,26 +95,29 @@ case class OracleRoutes(oracle: DLCOracleApi)(implicit
       }
 
     case ServerCommand("createdigitdecompevent", arr) =>
-      CreateDigitDecompEvent.fromJsArr(arr) match {
+      handleCommand(ServerCommand("createdigitdecompannouncement", arr))
+
+    case ServerCommand("createdigitdecompannouncement", arr) =>
+      CreateDigitDecompAnnouncement.fromJsArr(arr) match {
         case Failure(exception) =>
           reject(ValidationRejection("failure", Some(exception)))
         case Success(
-              CreateDigitDecompEvent(eventName,
-                                     maturationTime,
-                                     base,
-                                     isSigned,
-                                     numDigits,
-                                     unit,
-                                     precision)) =>
+              CreateDigitDecompAnnouncement(eventName,
+                                            maturationTime,
+                                            base,
+                                            isSigned,
+                                            numDigits,
+                                            unit,
+                                            precision)) =>
           complete {
             oracle
-              .createNewDigitDecompEvent(eventName,
-                                         maturationTime,
-                                         UInt16(base),
-                                         isSigned,
-                                         numDigits,
-                                         unit,
-                                         Int32(precision))
+              .createNewDigitDecompAnnouncement(eventName,
+                                                maturationTime,
+                                                UInt16(base),
+                                                isSigned,
+                                                numDigits,
+                                                unit,
+                                                Int32(precision))
               .map { announcementTLV =>
                 Server.httpSuccess(announcementTLV.hex)
               }
@@ -116,10 +125,12 @@ case class OracleRoutes(oracle: DLCOracleApi)(implicit
       }
 
     case ServerCommand("getevent", arr) =>
-      GetEvent.fromJsArr(arr) match {
+      handleCommand(ServerCommand("getannouncement", arr))
+    case ServerCommand("getannouncement", arr) =>
+      GetAnnouncement.fromJsArr(arr) match {
         case Failure(exception) =>
           reject(ValidationRejection("failure", Some(exception)))
-        case Success(GetEvent(eventName)) =>
+        case Success(GetAnnouncement(eventName)) =>
           complete {
             oracle.findEvent(eventName).map {
               case Some(event: OracleEvent) =>
@@ -173,7 +184,10 @@ case class OracleRoutes(oracle: DLCOracleApi)(implicit
                   "announcementTLV" -> Str(event.announcementTLV.hex),
                   "attestations" -> attestationJson,
                   "outcomes" -> outcomesJson,
-                  "signedOutcome" -> signedOutcomeJs
+                  "signedOutcome" -> signedOutcomeJs,
+                  // TLV shas for UI to have ids
+                  "announcementTLVsha256" -> event.announcementTLV.sha256.hex,
+                  "eventDescriptorTLVsha256" -> event.eventDescriptorTLV.sha256.hex
                 )
                 Server.httpSuccess(json)
               case None =>
@@ -183,13 +197,15 @@ case class OracleRoutes(oracle: DLCOracleApi)(implicit
       }
 
     case ServerCommand("signevent", arr) =>
-      SignEvent.fromJsArr(arr) match {
+      handleCommand(ServerCommand("signenum", arr))
+    case ServerCommand("signenum", arr) =>
+      SignEnum.fromJsArr(arr) match {
         case Failure(exception) =>
           reject(ValidationRejection("failure", Some(exception)))
-        case Success(SignEvent(eventName, outcome)) =>
+        case Success(SignEnum(eventName, outcome)) =>
           complete {
             oracle
-              .signEnumEvent(eventName, EnumAttestation(outcome))
+              .signEnum(eventName, EnumAttestation(outcome))
               .map { eventDb =>
                 val oracleEvent = OracleEvent.fromEventDbs(Vector(eventDb))
                 oracleEvent match {
@@ -218,10 +234,10 @@ case class OracleRoutes(oracle: DLCOracleApi)(implicit
       }
 
     case ServerCommand("getsignatures", arr) =>
-      GetEvent.fromJsArr(arr) match {
+      GetAnnouncement.fromJsArr(arr) match {
         case Failure(exception) =>
           reject(ValidationRejection("failure", Some(exception)))
-        case Success(GetEvent(eventName)) =>
+        case Success(GetAnnouncement(eventName)) =>
           complete {
             oracle.findEvent(eventName).map {
               case Some(completed: CompletedOracleEvent) =>
@@ -269,6 +285,46 @@ case class OracleRoutes(oracle: DLCOracleApi)(implicit
 
             Server.httpSuccess(ujson.Null)
           }
+      }
+
+    case ServerCommand("deleteannouncement", arr) =>
+      DeleteAnnouncement.fromJsArray(arr) match {
+        case Failure(err) =>
+          reject(ValidationRejection("failure", Some(err)))
+        case Success(deleteAnnouncement) =>
+          complete {
+            val deletedF =
+              oracle.deleteAnnouncement(deleteAnnouncement.eventName)
+            deletedF.map { d =>
+              Server.httpSuccess(d.hex)
+            }
+          }
+      }
+    case ServerCommand("deleteattestation", arr) =>
+      DeleteAttestation.fromJsArry(arr) match {
+        case Failure(err) =>
+          reject(ValidationRejection("failure", Some(err)))
+        case Success(deleteAttestation) =>
+          complete {
+            val deletedF =
+              oracle.deleteAttestation(deleteAttestation.eventName)
+            deletedF.map { d =>
+              Server.httpSuccess(d.announcementTLV.hex)
+            }
+          }
+      }
+    case ServerCommand("getoraclename", _) =>
+      complete {
+        oracle.oracleName().map { name =>
+          Server.httpSuccessOption(name)
+        }
+      }
+    case ServerCommand("setoraclename", arr) =>
+      complete {
+        val name = arr.arr.head.str
+        oracle.setOracleName(name).map { _ =>
+          Server.httpSuccess(name)
+        }
       }
   }
 }

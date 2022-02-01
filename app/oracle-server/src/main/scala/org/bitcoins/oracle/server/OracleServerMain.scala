@@ -1,9 +1,11 @@
 package org.bitcoins.oracle.server
 
 import akka.actor.ActorSystem
+import akka.stream.scaladsl.Source
 import org.bitcoins.commons.util.{DatadirParser, ServerArgParser}
+import org.bitcoins.dlc.oracle.DLCOracle
 import org.bitcoins.dlc.oracle.config.DLCOracleAppConfig
-import org.bitcoins.server.routes.{BitcoinSServerRunner, Server}
+import org.bitcoins.server.routes.{BitcoinSServerRunner, CommonRoutes, Server}
 import org.bitcoins.server.util.BitcoinSAppScalaDaemon
 
 import scala.concurrent.Future
@@ -20,22 +22,29 @@ class OracleServerMain(override val serverArgParser: ServerArgParser)(implicit
       case None          => conf.rpcBindOpt
     }
 
+    val commonRoutes = CommonRoutes(conf.baseDatadir)
+
     for {
       _ <- conf.start()
-      oracle <- conf.initialize()
-
-      routes = Seq(OracleRoutes(oracle))
+      oracle = new DLCOracle()
+      routes = Seq(OracleRoutes(oracle), commonRoutes)
       server = serverArgParser.rpcPortOpt match {
         case Some(rpcport) =>
           Server(conf = conf,
                  handlers = routes,
                  rpcbindOpt = bindConfOpt,
-                 rpcport = rpcport)
+                 rpcport = rpcport,
+                 rpcPassword = conf.rpcPassword,
+                 None,
+                 Source.empty)
         case None =>
           Server(conf = conf,
                  handlers = routes,
                  rpcbindOpt = bindConfOpt,
-                 rpcport = conf.rpcPort)
+                 rpcport = conf.rpcPort,
+                 rpcPassword = conf.rpcPassword,
+                 None,
+                 Source.empty)
       }
 
       _ <- server.start()
@@ -74,7 +83,7 @@ object OracleServerMain extends BitcoinSAppScalaDaemon {
   System.setProperty("bitcoins.log.location", datadirParser.networkDir.toString)
 
   implicit lazy val conf: DLCOracleAppConfig =
-    DLCOracleAppConfig(datadirParser.datadir, datadirParser.baseConfig)(
+    DLCOracleAppConfig(datadirParser.datadir, Vector(datadirParser.baseConfig))(
       system.dispatcher)
 
   new OracleServerMain(serverCmdLineArgs).run()

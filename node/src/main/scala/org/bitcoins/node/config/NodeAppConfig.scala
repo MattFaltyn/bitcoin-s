@@ -28,23 +28,19 @@ import scala.concurrent.{ExecutionContext, Future}
   * @param directory The data directory of the node
   * @param confs Optional sequence of configuration overrides
   */
-case class NodeAppConfig(
-    private val directory: Path,
-    private val confs: Config*)(implicit val system: ActorSystem)
+case class NodeAppConfig(baseDatadir: Path, configOverrides: Vector[Config])(
+    implicit val system: ActorSystem)
     extends DbAppConfig
     with NodeDbManagement
     with JdbcProfileComponent[NodeAppConfig] {
-  override protected[bitcoins] def configOverrides: List[Config] = confs.toList
   override protected[bitcoins] def moduleName: String = NodeAppConfig.moduleName
   override protected[bitcoins] type ConfigType = NodeAppConfig
 
   override protected[bitcoins] def newConfigOfType(
       configs: Seq[Config]): NodeAppConfig =
-    NodeAppConfig(directory, configs: _*)
+    NodeAppConfig(baseDatadir, configs.toVector)
 
   implicit override def ec: ExecutionContext = system.dispatcher
-
-  protected[bitcoins] def baseDatadir: Path = directory
 
   override def appConfig: NodeAppConfig = this
 
@@ -66,11 +62,11 @@ case class NodeAppConfig(
         nodeType match {
           case NodeType.BitcoindBackend =>
             val bitcoindRpcAppConfig =
-              BitcoindRpcAppConfig(directory, confs: _*)(system)
+              BitcoindRpcAppConfig(baseDatadir, configOverrides)(system)
             bitcoindRpcAppConfig.binaryOpt match {
               case Some(_) =>
-                bitcoindRpcAppConfig.client
-                  .start()
+                bitcoindRpcAppConfig.clientF
+                  .flatMap(_.start())
                   .map(_ => ())
               case None =>
                 Future.unit
@@ -112,7 +108,7 @@ case class NodeAppConfig(
   }
 
   lazy val torConf: TorAppConfig =
-    TorAppConfig(directory, confs: _*)
+    TorAppConfig(baseDatadir, Some(moduleName), configOverrides)
 
   lazy val socks5ProxyParams: Option[Socks5ProxyParams] =
     torConf.socks5ProxyParams
@@ -127,8 +123,14 @@ case class NodeAppConfig(
     }
   }
 
+  lazy val maxConnectedPeers: Int = {
+    if (config.hasPath("bitcoin-s.node.maxConnectedPeers"))
+      config.getInt("bitcoin-s.node.maxConnectedPeers")
+    else 1
+  }
+
   /** Creates either a neutrino node or a spv node based on the [[NodeAppConfig]] given */
-  def createNode(peers: Vector[Peer])(
+  def createNode(peers: Vector[Peer] = Vector.empty[Peer])(
       chainConf: ChainAppConfig,
       system: ActorSystem): Future[Node] = {
     NodeAppConfig.createNode(peers)(this, chainConf, system)
@@ -144,7 +146,7 @@ object NodeAppConfig extends AppConfigFactoryActorSystem[NodeAppConfig] {
     */
   override def fromDatadir(datadir: Path, confs: Vector[Config])(implicit
       system: ActorSystem): NodeAppConfig =
-    NodeAppConfig(datadir, confs: _*)
+    NodeAppConfig(datadir, confs)
 
   /** Creates either a neutrino node or a spv node based on the [[NodeAppConfig]] given */
   def createNode(peers: Vector[Peer])(implicit
@@ -163,9 +165,19 @@ object NodeAppConfig extends AppConfigFactoryActorSystem[NodeAppConfig] {
 
     nodeConf.nodeType match {
       case NodeType.SpvNode =>
-        dmhF.map(dmh => SpvNode(peers, dmh, nodeConf, chainConf, system))
+        dmhF.map(dmh =>
+          SpvNode(dmh,
+                  nodeConf,
+                  chainConf,
+                  system,
+                  configPeersOverride = peers))
       case NodeType.NeutrinoNode =>
-        dmhF.map(dmh => NeutrinoNode(peers, dmh, nodeConf, chainConf, system))
+        dmhF.map(dmh =>
+          NeutrinoNode(dmh,
+                       nodeConf,
+                       chainConf,
+                       system,
+                       configPeersOverride = peers))
       case NodeType.FullNode =>
         Future.failed(new RuntimeException("Not implemented"))
       case NodeType.BitcoindBackend =>

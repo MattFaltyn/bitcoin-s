@@ -1,10 +1,13 @@
 package org.bitcoins.testkit.fixtures
 
 import org.bitcoins.lnd.rpc.LndRpcClient
+import org.bitcoins.lnd.rpc.config.LndInstanceRemote
 import org.bitcoins.rpc.client.common.BitcoindRpcClient
 import org.bitcoins.testkit.lnd._
 import org.bitcoins.testkit.rpc._
 import org.scalatest.FutureOutcome
+
+import scala.io.Source
 
 /** A trait that is useful if you need Lnd fixtures for your test suite */
 trait LndFixture extends BitcoinSFixture with CachedBitcoindV21 {
@@ -57,6 +60,50 @@ trait DualLndFixture extends BitcoinSFixture with CachedBitcoindV21 {
         for {
           _ <- lndA.stop()
           _ <- lndB.stop()
+        } yield ()
+      }
+    )(test)
+  }
+}
+
+trait RemoteLndFixture extends BitcoinSFixture with CachedBitcoindV21 {
+
+  override type FixtureParam = LndRpcClient
+
+  override def withFixture(test: OneArgAsyncTest): FutureOutcome = {
+    withLnd(test)
+  }
+
+  def withLnd(test: OneArgAsyncTest): FutureOutcome = {
+    makeDependentFixture[LndRpcClient](
+      () => {
+        for {
+          bitcoind <- cachedBitcoindWithFundsF
+
+          // start and initialize a lnd
+          client = LndRpcTestClient.fromSbtDownload(Some(bitcoind))
+          lnd <- client.start()
+
+          // get certificate as a string
+          cert = {
+            val file = lnd.instance.certFileOpt.get
+            val source = Source.fromFile(file)
+            val str = source.getLines().toVector.mkString("\n")
+            source.close()
+
+            str
+          }
+
+          // create a remote instance and client
+          remoteInstance = LndInstanceRemote(lnd.instance.rpcUri,
+                                             lnd.instance.macaroon,
+                                             cert)
+          remoteLnd = LndRpcClient(remoteInstance)
+        } yield remoteLnd
+      },
+      { lnd =>
+        for {
+          _ <- lnd.stop()
         } yield ()
       }
     )(test)

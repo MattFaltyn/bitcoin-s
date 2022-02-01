@@ -4,43 +4,44 @@ import sbt._
 object Deps {
 
   object V {
-    val bouncyCastle = "1.69"
-    val dropwizardMetricsV = "4.2.3" //https://github.com/dropwizard/metrics
-    val logback = "1.2.6"
+    val bouncyCastle = "1.70"
+    val dropwizardMetricsV = "4.2.7" //https://github.com/dropwizard/metrics
+    val logback = "1.2.10"
     val grizzledSlf4j = "1.3.4"
     val scalacheck = "1.15.4"
-    val scalaTest = "3.2.9"
+    val scalaTest = "3.2.10"
 
     val scalaTestPlus =
-      "3.2.1.0" //super annoying... https://oss.sonatype.org/content/groups/public/org/scalatestplus/
-    val slf4j = "1.7.32"
+      "3.2.2.0" //super annoying... https://oss.sonatype.org/content/groups/public/org/scalatestplus/
+    val slf4j = "1.7.33"
     val spray = "1.3.6"
     val zeromq = "0.5.2"
-    val akkav = "10.2.6"
+    val akkav = "10.2.7"
     val playv = "2.9.2"
-    val akkaStreamv = "2.6.16"
-    val scodecV = "1.1.28"
-    val junitV = "0.11"
-    val nativeLoaderV = "2.3.5"
+    val akkaStreamv = "2.6.18"
+    val jUnixSocketV = "2.4.0"
+    val scodecV = "1.1.30"
+    val junitV = "0.13.3"
+    val nativeLoaderV = "2.4.0"
     val typesafeConfigV = "1.4.1"
 
-    val scalaFxV = "16.0.0-R24"
-    val javaFxV = "17-ea+8"
+    val scalaFxV = "16.0.0-R25"
+    val javaFxV = "18-ea+10"
 
     val asyncNewScalaV = "1.0.1"
 
     val flywayV = "6.4.2"
-    val postgresV = "42.2.23"
+    val postgresV = "42.3.1"
     val akkaActorV = akkaStreamv
     val slickV = "3.3.3"
     val sqliteV = "3.36.0.3"
 
     val scalameterV = "0.17"
-    val scalamockV = "5.1.0"
-    val scalaCollectionCompatV = "2.5.0"
+    val scalamockV = "5.2.0"
+    val scalaCollectionCompatV = "2.6.0"
     val pgEmbeddedV = "0.13.4"
 
-    val breezeV = "1.2"
+    val breezeV = "1.3"
 
     val newMicroPickleV = "1.3.8"
     val newMicroJsonV = newMicroPickleV
@@ -102,6 +103,9 @@ object Deps {
 
     val akkaTestkit =
       "com.typesafe.akka" %% "akka-testkit" % V.akkaActorV withSources () withJavadoc ()
+
+    val jUnixSocket =
+      "com.kohlschutter.junixsocket" % "junixsocket-core" % V.jUnixSocketV
 
     val scalaFx =
       "org.scalafx" %% "scalafx" % V.scalaFxV withSources () withJavadoc ()
@@ -240,7 +244,7 @@ object Deps {
       "org.scala-lang.modules" %% "scala-async" % V.asyncNewScalaV % "test" withSources () withJavadoc ()
 
     val junitInterface =
-      "com.novocode" % "junit-interface" % V.junitV % "test" withSources () withJavadoc ()
+      "com.github.sbt" % "junit-interface" % V.junitV % "test" withSources () withJavadoc ()
     val logback = Compile.logback % "test"
     val grizzledSlf4j = Compile.grizzledSlf4j % "test"
 
@@ -476,6 +480,20 @@ object Deps {
     Compile.grizzledSlf4j
   )
 
+  val clightningRpc = List(
+    Compile.jUnixSocket,
+    Compile.playJson,
+    Compile.grizzledSlf4j
+  )
+
+  val clightningRpcTest = Def.setting {
+    List(
+      Test.logback,
+      Test.scalaTest.value,
+      Test.scalacheck.value
+    )
+  }
+
   val tor: Def.Initialize[List[ModuleID]] = Def.setting {
     List(
       Compile.akkaStream,
@@ -514,6 +532,21 @@ object Deps {
   }
 
   def feeProviderTest = Def.setting {
+    List(
+      Test.akkaTestkit,
+      Test.scalaTest.value
+    )
+  }
+
+  val esplora = Def.setting {
+    List(
+      Compile.akkaHttp,
+      Compile.akkaActor,
+      Compile.akkaStream
+    )
+  }
+
+  val esploraTest = Def.setting {
     List(
       Test.akkaTestkit,
       Test.scalaTest.value

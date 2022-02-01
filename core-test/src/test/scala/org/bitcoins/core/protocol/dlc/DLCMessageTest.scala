@@ -10,7 +10,7 @@ import org.bitcoins.core.protocol.dlc.models.DLCMessage.{
   DLCSign
 }
 import org.bitcoins.core.protocol.dlc.models._
-import org.bitcoins.core.protocol.tlv.EnumOutcome
+import org.bitcoins.core.protocol.tlv.{DLCOfferTLV, EnumOutcome}
 import org.bitcoins.core.psbt.InputPSBTRecord.PartialSignature
 import org.bitcoins.core.wallet.fee.SatoshisPerVirtualByte
 import org.bitcoins.crypto._
@@ -47,7 +47,8 @@ class DLCMessageTest extends BitcoinSJvmTest {
   it must "not allow a negative collateral for a DLCOffer" in {
     assertThrows[IllegalArgumentException](
       DLCOffer(
-        contractInfo = ContractInfo.dummy,
+        protocolVersionOpt = DLCOfferTLV.currentVersionOpt,
+        contractInfo = SingleContractInfo.dummy,
         pubKeys = DLCPublicKeys(dummyPubKey, dummyAddress),
         totalCollateral = Satoshis(-1),
         fundingInputs = Vector.empty,
@@ -63,7 +64,8 @@ class DLCMessageTest extends BitcoinSJvmTest {
   it must "not allow same change and fund output serial id for a DLCOffer" in {
     assertThrows[IllegalArgumentException](
       DLCOffer(
-        contractInfo = ContractInfo.dummy,
+        protocolVersionOpt = DLCOfferTLV.currentVersionOpt,
+        contractInfo = SingleContractInfo.dummy,
         pubKeys = DLCPublicKeys(dummyPubKey, dummyAddress),
         totalCollateral = Satoshis(-1),
         fundingInputs = Vector.empty,
@@ -89,8 +91,8 @@ class DLCMessageTest extends BitcoinSJvmTest {
           Vector(
             EnumOracleOutcome(
               Vector(dummyOracle),
-              EnumOutcome(dummyStr)).sigPoint -> ECAdaptorSignature.dummy),
-          dummySig),
+              EnumOutcome(dummyStr)).sigPoint -> ECAdaptorSignature.dummy)),
+        dummySig,
         DLCAccept.NoNegotiationFields,
         Sha256Digest.empty
       )

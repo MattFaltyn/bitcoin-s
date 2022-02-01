@@ -4,6 +4,7 @@ import akka.actor.ActorSystem
 import akka.http.scaladsl.server.Directives._
 import akka.http.scaladsl.server._
 import akka.stream.Materializer
+import grizzled.slf4j.Logging
 import org.bitcoins.commons.serializers.Picklers._
 import org.bitcoins.core.api.wallet.db.SpendingInfoDb
 import org.bitcoins.core.currency._
@@ -12,6 +13,7 @@ import org.bitcoins.core.protocol.transaction.Transaction
 import org.bitcoins.core.wallet.utxo.{AddressLabelTagType, TxoState}
 import org.bitcoins.crypto.NetworkElement
 import org.bitcoins.core.api.dlc.wallet.AnyDLCHDWalletApi
+import org.bitcoins.core.wallet.fee.SatoshisPerVirtualByte
 import org.bitcoins.keymanager._
 import org.bitcoins.keymanager.config.KeyManagerAppConfig
 import org.bitcoins.server.routes.{Server, ServerCommand, ServerRoute}
@@ -27,7 +29,8 @@ import scala.util.{Failure, Success}
 case class WalletRoutes(wallet: AnyDLCHDWalletApi)(implicit
     system: ActorSystem,
     walletConf: WalletAppConfig)
-    extends ServerRoute {
+    extends ServerRoute
+    with Logging {
   import system.dispatcher
 
   implicit val kmConf: KeyManagerAppConfig = walletConf.kmConf
@@ -89,10 +92,9 @@ case class WalletRoutes(wallet: AnyDLCHDWalletApi)(implicit
         case GetBalance(isSats) =>
           complete {
             wallet.getBalance().map { balance =>
-              Server.httpSuccess(
-                if (isSats) balance.satoshis.toString
-                else Bitcoins(balance.satoshis).toString
-              )
+              val result: Double =
+                formatCurrencyUnit(currencyUnit = balance, isSats = isSats)
+              Server.httpSuccess(result)
             }
           }
       }
@@ -102,10 +104,9 @@ case class WalletRoutes(wallet: AnyDLCHDWalletApi)(implicit
         case GetBalance(isSats) =>
           complete {
             wallet.getConfirmedBalance().map { balance =>
-              Server.httpSuccess(
-                if (isSats) balance.satoshis.toString
-                else Bitcoins(balance.satoshis).toString
-              )
+              val result: Double =
+                formatCurrencyUnit(currencyUnit = balance, isSats = isSats)
+              Server.httpSuccess(result)
             }
           }
       }
@@ -115,10 +116,9 @@ case class WalletRoutes(wallet: AnyDLCHDWalletApi)(implicit
         case GetBalance(isSats) =>
           complete {
             wallet.getUnconfirmedBalance().map { balance =>
-              Server.httpSuccess(
-                if (isSats) balance.satoshis.toString
-                else Bitcoins(balance.satoshis).toString
-              )
+              val result: Double =
+                formatCurrencyUnit(currencyUnit = balance, isSats = isSats)
+              Server.httpSuccess(result)
             }
           }
       }
@@ -126,7 +126,7 @@ case class WalletRoutes(wallet: AnyDLCHDWalletApi)(implicit
     case ServerCommand("getbalances", arr) =>
       GetBalance.fromJsArr(arr) match {
         case Failure(exception) =>
-          reject(ValidationRejection("failure", Some(exception)))
+          complete(Server.httpBadRequest(exception))
         case Success(GetBalance(isSats)) =>
           complete {
             for {
@@ -134,19 +134,18 @@ case class WalletRoutes(wallet: AnyDLCHDWalletApi)(implicit
               unconfirmed <- wallet.getUnconfirmedBalance()
               reservedUtxos <- wallet.listUtxos(TxoState.Reserved)
             } yield {
-              def balToStr(bal: CurrencyUnit): String = {
-                if (isSats) bal.satoshis.toString
-                else Bitcoins(bal.satoshis).toString
-              }
 
               val reserved = reservedUtxos.map(_.output.value).sum
               val total = confirmed + unconfirmed + reserved
 
               val json = Obj(
-                "confirmed" -> Str(balToStr(confirmed)),
-                "unconfirmed" -> Str(balToStr(unconfirmed)),
-                "reserved" -> Str(balToStr(reserved)),
-                "total" -> Str(balToStr(total))
+                "confirmed" -> Num(
+                  formatCurrencyUnit(confirmed, isSats).toDouble),
+                "unconfirmed" -> Num(
+                  formatCurrencyUnit(unconfirmed, isSats).toDouble),
+                "reserved" -> Num(
+                  formatCurrencyUnit(reserved, isSats).toDouble),
+                "total" -> Num(formatCurrencyUnit(total, isSats).toDouble)
               )
               Server.httpSuccess(json)
             }
@@ -157,10 +156,13 @@ case class WalletRoutes(wallet: AnyDLCHDWalletApi)(implicit
       withValidServerCommand(GetNewAddress.fromJsArr(arr)) {
         case GetNewAddress(labelOpt) =>
           complete {
-            val labelVec = Vector(labelOpt).flatten
-            wallet.getNewAddress(labelVec).map { address =>
-              Server.httpSuccess(address)
+            val addressF = labelOpt match {
+              case Some(label) =>
+                wallet.getNewAddress(Vector(label))
+              case None =>
+                wallet.getNewAddress()
             }
+            addressF.map(address => Server.httpSuccess(address))
           }
       }
 
@@ -264,7 +266,7 @@ case class WalletRoutes(wallet: AnyDLCHDWalletApi)(implicit
     case ServerCommand("getdlc", arr) =>
       GetDLC.fromJsArr(arr) match {
         case Failure(exception) =>
-          reject(ValidationRejection("failure", Some(exception)))
+          complete(Server.httpBadRequest(exception))
         case Success(GetDLC(paramHash)) =>
           complete {
             wallet.findDLC(paramHash).map {
@@ -278,7 +280,7 @@ case class WalletRoutes(wallet: AnyDLCHDWalletApi)(implicit
     case ServerCommand("canceldlc", arr) =>
       GetDLC.fromJsArr(arr) match {
         case Failure(exception) =>
-          reject(ValidationRejection("failure", Some(exception)))
+          complete(Server.httpBadRequest(exception))
         case Success(GetDLC(paramHash)) =>
           complete {
             wallet.cancelDLC(paramHash).map { _ =>
@@ -290,7 +292,7 @@ case class WalletRoutes(wallet: AnyDLCHDWalletApi)(implicit
     case ServerCommand("createdlcoffer", arr) =>
       CreateDLCOffer.fromJsArr(arr) match {
         case Failure(exception) =>
-          reject(ValidationRejection("failure", Some(exception)))
+          complete(Server.httpBadRequest(exception))
         case Success(
               CreateDLCOffer(contractInfo,
                              collateral,
@@ -324,7 +326,7 @@ case class WalletRoutes(wallet: AnyDLCHDWalletApi)(implicit
     case ServerCommand("acceptdlcoffer", arr) =>
       AcceptDLCOffer.fromJsArr(arr) match {
         case Failure(exception) =>
-          reject(ValidationRejection("failure", Some(exception)))
+          complete(Server.httpBadRequest(exception))
         case Success(AcceptDLCOffer(offer)) =>
           complete {
             wallet
@@ -338,7 +340,7 @@ case class WalletRoutes(wallet: AnyDLCHDWalletApi)(implicit
     case ServerCommand("acceptdlcofferfromfile", arr) =>
       DLCDataFromFile.fromJsArr(arr) match {
         case Failure(exception) =>
-          reject(ValidationRejection("failure", Some(exception)))
+          complete(Server.httpBadRequest(exception))
         case Success(DLCDataFromFile(path, destOpt)) =>
           complete {
 
@@ -358,7 +360,7 @@ case class WalletRoutes(wallet: AnyDLCHDWalletApi)(implicit
     case ServerCommand("signdlc", arr) =>
       SignDLC.fromJsArr(arr) match {
         case Failure(exception) =>
-          reject(ValidationRejection("failure", Some(exception)))
+          complete(Server.httpBadRequest(exception))
         case Success(SignDLC(accept)) =>
           complete {
             wallet
@@ -372,7 +374,7 @@ case class WalletRoutes(wallet: AnyDLCHDWalletApi)(implicit
     case ServerCommand("signdlcfromfile", arr) =>
       DLCDataFromFile.fromJsArr(arr) match {
         case Failure(exception) =>
-          reject(ValidationRejection("failure", Some(exception)))
+          complete(Server.httpBadRequest(exception))
         case Success(DLCDataFromFile(path, destOpt)) =>
           complete {
 
@@ -392,7 +394,7 @@ case class WalletRoutes(wallet: AnyDLCHDWalletApi)(implicit
     case ServerCommand("adddlcsigs", arr) =>
       AddDLCSigs.fromJsArr(arr) match {
         case Failure(exception) =>
-          reject(ValidationRejection("failure", Some(exception)))
+          complete(Server.httpBadRequest(exception))
         case Success(AddDLCSigs(sigs)) =>
           complete {
             wallet.addDLCSigs(sigs.tlv).map { db =>
@@ -405,7 +407,7 @@ case class WalletRoutes(wallet: AnyDLCHDWalletApi)(implicit
     case ServerCommand("adddlcsigsfromfile", arr) =>
       DLCDataFromFile.fromJsArr(arr) match {
         case Failure(exception) =>
-          reject(ValidationRejection("failure", Some(exception)))
+          complete(Server.httpBadRequest(exception))
         case Success(DLCDataFromFile(path, _)) =>
           complete {
 
@@ -423,7 +425,7 @@ case class WalletRoutes(wallet: AnyDLCHDWalletApi)(implicit
     case ServerCommand("adddlcsigsandbroadcast", arr) =>
       AddDLCSigs.fromJsArr(arr) match {
         case Failure(exception) =>
-          reject(ValidationRejection("failure", Some(exception)))
+          complete(Server.httpBadRequest(exception))
         case Success(AddDLCSigs(sigs)) =>
           complete {
             for {
@@ -436,7 +438,7 @@ case class WalletRoutes(wallet: AnyDLCHDWalletApi)(implicit
     case ServerCommand("adddlcsigsandbroadcastfromfile", arr) =>
       DLCDataFromFile.fromJsArr(arr) match {
         case Failure(exception) =>
-          reject(ValidationRejection("failure", Some(exception)))
+          complete(Server.httpBadRequest(exception))
         case Success(DLCDataFromFile(path, _)) =>
           val hex = Files.readAllLines(path).get(0)
 
@@ -452,7 +454,7 @@ case class WalletRoutes(wallet: AnyDLCHDWalletApi)(implicit
     case ServerCommand("getdlcfundingtx", arr) =>
       GetDLCFundingTx.fromJsArr(arr) match {
         case Failure(exception) =>
-          reject(ValidationRejection("failure", Some(exception)))
+          complete(Server.httpBadRequest(exception))
         case Success(GetDLCFundingTx(contractId)) =>
           complete {
             wallet.getDLCFundingTx(contractId).map { tx =>
@@ -464,7 +466,7 @@ case class WalletRoutes(wallet: AnyDLCHDWalletApi)(implicit
     case ServerCommand("broadcastdlcfundingtx", arr) =>
       BroadcastDLCFundingTx.fromJsArr(arr) match {
         case Failure(exception) =>
-          reject(ValidationRejection("failure", Some(exception)))
+          complete(Server.httpBadRequest(exception))
         case Success(BroadcastDLCFundingTx(contractId)) =>
           complete {
             wallet.broadcastDLCFundingTx(contractId).map { tx =>
@@ -476,7 +478,7 @@ case class WalletRoutes(wallet: AnyDLCHDWalletApi)(implicit
     case ServerCommand("executedlc", arr) =>
       ExecuteDLC.fromJsArr(arr) match {
         case Failure(exception) =>
-          reject(ValidationRejection("failure", Some(exception)))
+          complete(Server.httpBadRequest(exception))
         case Success(ExecuteDLC(contractId, sigs, noBroadcast)) =>
           complete {
             for {
@@ -491,7 +493,7 @@ case class WalletRoutes(wallet: AnyDLCHDWalletApi)(implicit
     case ServerCommand("executedlcrefund", arr) =>
       ExecuteDLCRefund.fromJsArr(arr) match {
         case Failure(exception) =>
-          reject(ValidationRejection("failure", Some(exception)))
+          complete(Server.httpBadRequest(exception))
         case Success(ExecuteDLCRefund(contractId, noBroadcast)) =>
           complete {
             for {
@@ -811,9 +813,16 @@ case class WalletRoutes(wallet: AnyDLCHDWalletApi)(implicit
 
     case ServerCommand("estimatefee", _) =>
       complete {
-        wallet.getFeeRate.map { fee =>
-          Server.httpSuccess(fee.toString)
-        }
+        val feeRateF = wallet
+          .getFeeRate()
+          .recover { case scala.util.control.NonFatal(exn) =>
+            logger.error(
+              s"Failed to fetch fee rate from wallet, returning -1 sats/vbyte",
+              exn)
+            SatoshisPerVirtualByte.negativeOne
+          }
+
+        feeRateF.map(f => Server.httpSuccess(f.toSatsPerVByte))
       }
 
     case ServerCommand("getdlcwalletaccounting", _) =>
@@ -829,6 +838,7 @@ case class WalletRoutes(wallet: AnyDLCHDWalletApi)(implicit
     for {
       accountDb <- wallet.getDefaultAccount()
       walletState <- wallet.getSyncState()
+      rescan <- wallet.isRescanning()
     } yield {
       Obj(
         WalletAppConfig.moduleName ->
@@ -840,9 +850,20 @@ case class WalletRoutes(wallet: AnyDLCHDWalletApi)(implicit
             "xpub" -> Str(accountDb.xpub.toString),
             "hdPath" -> Str(accountDb.hdAccount.toString),
             "height" -> Num(walletState.height),
-            "blockHash" -> Str(walletState.blockHash.hex)
+            "blockHash" -> Str(walletState.blockHash.hex),
+            "rescan" -> rescan
           )
       )
+    }
+  }
+
+  private def formatCurrencyUnit(
+      currencyUnit: CurrencyUnit,
+      isSats: Boolean): Double = {
+    if (isSats) {
+      currencyUnit.satoshis.toBigDecimal.toDouble
+    } else {
+      Bitcoins(currencyUnit.satoshis).toBigDecimal.toDouble
     }
   }
 }

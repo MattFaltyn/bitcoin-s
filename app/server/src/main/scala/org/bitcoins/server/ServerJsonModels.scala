@@ -1,6 +1,8 @@
 package org.bitcoins.server
 
 import org.bitcoins.commons.jsonmodels.bitcoind.RpcOpts.LockUnspentOutputParameter
+import org.bitcoins.commons.jsonmodels.cli.ContractDescriptorParser
+import org.bitcoins.commons.serializers.{JsonReaders}
 import org.bitcoins.core.api.wallet.CoinSelectionAlgo
 import org.bitcoins.core.crypto._
 import org.bitcoins.core.currency.{Bitcoins, Satoshis}
@@ -8,6 +10,7 @@ import org.bitcoins.core.hd.AddressType
 import org.bitcoins.core.hd.AddressType.SegWit
 import org.bitcoins.core.number.UInt32
 import org.bitcoins.core.protocol.BlockStamp.BlockHeight
+import org.bitcoins.core.protocol.dlc.models.ContractDescriptor
 import org.bitcoins.core.protocol.tlv._
 import org.bitcoins.core.protocol.transaction.{Transaction, TransactionOutPoint}
 import org.bitcoins.core.protocol.{BitcoinAddress, BlockStamp}
@@ -28,17 +31,20 @@ case class GetNewAddress(labelOpt: Option[AddressLabelTag])
 object GetNewAddress extends ServerJsonModels {
 
   def fromJsArr(jsArr: ujson.Arr): Try[GetNewAddress] = {
-    require(jsArr.arr.size == 1,
-            s"Bad number of arguments: ${jsArr.arr.size}. Expected: 1")
+    if (jsArr.value.length == 1) {
+      val labelOpt = nullToOpt(jsArr.arr.head).map {
+        case Str(str) =>
+          AddressLabelTag(str)
+        case value: Value =>
+          throw Value.InvalidData(value, "Expected a String")
+      }
 
-    val labelOpt = nullToOpt(jsArr.arr.head).map {
-      case Str(str) =>
-        AddressLabelTag(str)
-      case value: Value =>
-        throw Value.InvalidData(value, "Expected a String")
+      Try(GetNewAddress(labelOpt))
+    } else if (jsArr.value.isEmpty) {
+      Success(GetNewAddress(None))
+    } else {
+      sys.error(s"Too many argumements for GetNewAddress, got=$jsArr")
     }
-
-    Try(GetNewAddress(labelOpt))
   }
 }
 
@@ -729,6 +735,66 @@ object DecodeOffer extends ServerJsonModels {
   }
 }
 
+case class DecodeAccept(accept: DLCAcceptTLV)
+
+object DecodeAccept extends ServerJsonModels {
+
+  def fromJsArr(jsArr: ujson.Arr): Try[DecodeAccept] = {
+    jsArr.arr.toList match {
+      case acceptJs :: Nil =>
+        Try {
+          val accept: LnMessage[DLCAcceptTLV] =
+            LnMessageFactory(DLCAcceptTLV).fromHex(acceptJs.str)
+          DecodeAccept(accept.tlv)
+        } match {
+          case Success(value) =>
+            Success(value)
+          case Failure(_) =>
+            Try {
+              val accept = DLCAcceptTLV.fromHex(acceptJs.str)
+              DecodeAccept(accept)
+            }
+        }
+      case Nil =>
+        Failure(new IllegalArgumentException(s"Missing accept announcement"))
+      case other =>
+        Failure(
+          new IllegalArgumentException(
+            s"Bad number of arguments: ${other.length} Expected: 1"))
+    }
+  }
+}
+
+case class DecodeSign(sign: DLCSignTLV)
+
+object DecodeSign extends ServerJsonModels {
+
+  def fromJsArr(jsArr: ujson.Arr): Try[DecodeSign] = {
+    jsArr.arr.toList match {
+      case signJs :: Nil =>
+        Try {
+          val accept: LnMessage[DLCSignTLV] =
+            LnMessageFactory(DLCSignTLV).fromHex(signJs.str)
+          DecodeSign(accept.tlv)
+        } match {
+          case Success(value) =>
+            Success(value)
+          case Failure(_) =>
+            Try {
+              val sign = DLCSignTLV.fromHex(signJs.str)
+              DecodeSign(sign)
+            }
+        }
+      case Nil =>
+        Failure(new IllegalArgumentException(s"Missing accept announcement"))
+      case other =>
+        Failure(
+          new IllegalArgumentException(
+            s"Bad number of arguments: ${other.length} Expected: 1"))
+    }
+  }
+}
+
 case class DecodeAnnouncement(announcement: OracleAnnouncementTLV)
 
 object DecodeAnnouncement extends ServerJsonModels {
@@ -1160,24 +1226,37 @@ object BumpFee extends ServerJsonModels {
   }
 }
 
-case class ZipDataDir(path: Path)
+case class CreateContractInfo(
+    announcementTLV: OracleAnnouncementTLV,
+    totalCollateral: Satoshis,
+    contractDescriptorTLV: ContractDescriptorTLV) {
 
-object ZipDataDir extends ServerJsonModels {
+  def contractDescriptor: ContractDescriptor = {
+    ContractDescriptor.fromTLV(contractDescriptorTLV)
+  }
+}
 
-  def fromJsArr(jsArr: ujson.Arr): Try[ZipDataDir] = {
-    jsArr.arr.toList match {
-      case pathJs :: Nil =>
+object CreateContractInfo extends ServerJsonModels {
+
+  def fromJsArr(arr: ujson.Arr): Try[CreateContractInfo] = {
+    arr.arr.toVector match {
+      case announcementVal +: totalCollateralVal +: payoutsVal +: Vector() =>
         Try {
-          val path = new File(pathJs.str).toPath
-          ZipDataDir(path)
-        }
-      case Nil =>
-        Failure(new IllegalArgumentException("Missing path argument"))
+          val announcementTLV =
+            OracleAnnouncementTLV.fromHex(announcementVal.str)
+          val totalCollateral = Satoshis(totalCollateralVal.num.toLong)
+          //validate that these are part of the announcement?
+          val contractDescriptor =
+            ContractDescriptorParser.parseCmdLine(payoutsVal, announcementTLV)
 
+          CreateContractInfo(announcementTLV,
+                             totalCollateral,
+                             contractDescriptor)
+        }
       case other =>
-        Failure(
-          new IllegalArgumentException(
-            s"Bad number of arguments: ${other.length}. Expected: 1"))
+        val exn = new IllegalArgumentException(
+          s"Bad number or arguments to createcontractinfo, got=${other.length} expected=3")
+        Failure(exn)
     }
   }
 }
@@ -1222,15 +1301,7 @@ trait ServerJsonModels {
         throw Value.InvalidData(js, "Expected a UInt32")
     }
 
-  def jsToSatoshis(js: Value): Satoshis =
-    js match {
-      case str: Str =>
-        Satoshis(BigInt(str.value))
-      case num: Num =>
-        Satoshis(num.value.toLong)
-      case _: Value =>
-        throw Value.InvalidData(js, "Expected value in Satoshis")
-    }
+  def jsToSatoshis(js: Value): Satoshis = JsonReaders.jsToSatoshis(js)
 
   def jsToBitcoinAddress(js: Value): BitcoinAddress = {
     try {

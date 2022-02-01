@@ -4,8 +4,8 @@ import akka.actor.{ActorSystem, Cancellable}
 import grizzled.slf4j.Logging
 import org.bitcoins.cli.CliCommand._
 import org.bitcoins.cli.ConsoleCli
-import org.bitcoins.commons.serializers.PicklerKeys
 import org.bitcoins.core.dlc.accounting.RateOfReturnUtil
+import org.bitcoins.core.serializers.PicklerKeys
 import org.bitcoins.core.wallet.fee.FeeUnit
 import org.bitcoins.gui.dialog._
 import org.bitcoins.gui.dlc.DLCPaneModel
@@ -142,17 +142,13 @@ class WalletGUIModel(dlcModel: DLCPaneModel)(implicit system: ActorSystem)
       case Success(commandReturn) =>
         val json = ujson.read(commandReturn).obj
         val confirmedBalance =
-          GUIUtil.numberFormatter.format(
-            json("confirmed").str.split(' ').head.toLong)
+          GUIUtil.numberFormatter.format(json("confirmed").num)
         val unconfirmedBalance =
-          GUIUtil.numberFormatter.format(
-            json("unconfirmed").str.split(' ').head.toLong)
+          GUIUtil.numberFormatter.format(json("unconfirmed").num)
         val reservedBalance =
-          GUIUtil.numberFormatter.format(
-            json("reserved").str.split(' ').head.toLong)
+          GUIUtil.numberFormatter.format(json("reserved").num)
         val totalBalance =
-          GUIUtil.numberFormatter.format(
-            json("total").str.split(' ').head.toLong)
+          GUIUtil.numberFormatter.format(json("total").num)
 
         GlobalData.currentConfirmedBalance.value = confirmedBalance
         GlobalData.currentUnconfirmedBalance.value = unconfirmedBalance

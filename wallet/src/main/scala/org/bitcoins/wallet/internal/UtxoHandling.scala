@@ -277,7 +277,7 @@ private[wallet] trait UtxoHandling extends WalletLogger {
     } yield {
       val writtenOut = written.outPoint
       logger.info(
-        s"Successfully inserted UTXO ${writtenOut.txId.hex}:${writtenOut.vout.toInt} into DB")
+        s"Successfully inserted UTXO ${writtenOut.txIdBE.hex}:${writtenOut.vout.toInt} amt=${output.value} into DB")
       logger.debug(s"UTXO details: ${written.output}")
       written
     }
@@ -297,8 +297,7 @@ private[wallet] trait UtxoHandling extends WalletLogger {
     } else {
       val output = transaction.outputs(vout.toInt)
       val outPoint = TransactionOutPoint(transaction.txId, vout)
-      logger.info(
-        s"Adding UTXO to wallet: ${transaction.txId.hex}:${vout.toInt} amt=${output.value}")
+
       // insert the UTXO into the DB
       val insertedUtxoEF: Either[AddUtxoError, Future[SpendingInfoDb]] = for {
         addressDb <- addressDbE
@@ -316,9 +315,11 @@ private[wallet] trait UtxoHandling extends WalletLogger {
 
   override def markUTXOsAsReserved(
       utxos: Vector[SpendingInfoDb]): Future[Vector[SpendingInfoDb]] = {
+    val outPoints = utxos.map(_.outPoint)
+    logger.info(s"Reserving utxos=$outPoints")
     val updated = utxos.map(_.copyWithState(TxoState.Reserved))
     for {
-      utxos <- spendingInfoDAO.updateAllSpendingInfoDb(updated)
+      utxos <- spendingInfoDAO.markAsReserved(updated)
       _ <- walletCallbacks.executeOnReservedUtxos(logger, utxos)
     } yield utxos
   }
@@ -328,20 +329,28 @@ private[wallet] trait UtxoHandling extends WalletLogger {
       tx: Transaction): Future[Vector[SpendingInfoDb]] = {
     for {
       utxos <- spendingInfoDAO.findOutputsBeingSpent(tx)
-      reserved <- markUTXOsAsReserved(utxos.toVector)
+      reserved <- markUTXOsAsReserved(utxos)
     } yield reserved
   }
 
   override def unmarkUTXOsAsReserved(
       utxos: Vector[SpendingInfoDb]): Future[Vector[SpendingInfoDb]] = {
-    val unreserved = utxos.filterNot(_.state == TxoState.Reserved)
-    require(unreserved.isEmpty, s"Some utxos are not reserved, got $unreserved")
+    logger.info(s"Unreserving utxos ${utxos.map(_.outPoint)}")
+    val updatedUtxosF = Future {
+      //make sure exception isn't thrown outside of a future to fix
+      //see: https://github.com/bitcoin-s/bitcoin-s/issues/3813
+      val unreserved = utxos.filterNot(_.state == TxoState.Reserved)
+      require(unreserved.isEmpty,
+              s"Some utxos are not reserved, got $unreserved")
 
-    // unmark all utxos are reserved
-    val updatedUtxos = utxos
-      .map(_.copyWithState(TxoState.PendingConfirmationsReceived))
+      // unmark all utxos are reserved
+      val updatedUtxos = utxos
+        .map(_.copyWithState(TxoState.PendingConfirmationsReceived))
+      updatedUtxos
+    }
 
     for {
+      updatedUtxos <- updatedUtxosF
       // update the confirmed utxos
       updatedConfirmed <- updateUtxoConfirmedStates(updatedUtxos)
 

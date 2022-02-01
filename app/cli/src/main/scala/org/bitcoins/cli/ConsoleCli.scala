@@ -53,6 +53,9 @@ object ConsoleCli {
       opt[Int]("rpcport")
         .action((port, conf) => conf.copy(rpcPortOpt = Some(port)))
         .text(s"The port to send our rpc request to on the server"),
+      opt[String]("password")
+        .action((password, conf) => conf.copy(rpcPassword = password))
+        .text(s"The password to send our rpc request to on the server"),
       opt[Unit]("version")
         .action((_, conf) => conf.copy(command = GetVersion))
         .hidden(),
@@ -87,6 +90,9 @@ object ConsoleCli {
                 case gbh: GetBlockHeader => gbh.copy(hash = hash)
                 case other               => other
               }))),
+      cmd("getmediantimepast")
+        .action((_, conf) => conf.copy(command = GetMedianTimePast))
+        .text(s"Get the median time past"),
       cmd("decoderawtransaction")
         .action((_, conf) =>
           conf.copy(command = DecodeRawTransaction(EmptyTransaction)))
@@ -1122,6 +1128,38 @@ object ConsoleCli {
                 case _: GetDLC => GetDLC(dlcId)
                 case other     => other
               }))),
+      cmd("createcontractinfo")
+        .action((_, conf) => conf.copy(command = CreateContractInfo.empty))
+        .text("Create a contract info from an announcement, total collateral, and contract descriptor")
+        .children(
+          arg[OracleAnnouncementTLV]("announcement")
+            .text("The announcement we are creating a contract info for")
+            .required()
+            .action((ann, conf) =>
+              conf.copy(command = conf.command match {
+                case create: CreateContractInfo =>
+                  create.copy(announcementTLV = ann)
+                case other => other
+              })),
+          arg[Satoshis]("totalCollateral")
+            .text("The total collateral in the DLC. This is your collateral + counterparty collateral")
+            .required()
+            .action((totalCollateral, conf) =>
+              conf.copy(command = conf.command match {
+                case create: CreateContractInfo =>
+                  create.copy(totalCollateral = totalCollateral)
+                case other => other
+              })),
+          arg[ujson.Value]("contractDescriptor")
+            .text("The contract descriptor in the DLC. This is expected to be of format [[outcome1, payout1], [outcome2, payout2], ...]")
+            .required()
+            .action((contractDescriptor, conf) =>
+              conf.copy(command = conf.command match {
+                case create: CreateContractInfo =>
+                  create.copy(contractDescriptor = contractDescriptor)
+                case other => other
+              }))
+        ),
       note(sys.props("line.separator") + "=== Network ==="),
       cmd("getpeers")
         .action((_, conf) => conf.copy(command = GetPeers))
@@ -1250,20 +1288,21 @@ object ConsoleCli {
       cmd("getstakingaddress")
         .action((_, conf) => conf.copy(command = GetStakingAddress))
         .text(s"Get oracle's staking address"),
-      cmd("listevents")
-        .action((_, conf) => conf.copy(command = ListEvents))
-        .text(s"Lists all event names"),
-      cmd("createenumevent")
+      cmd("listannouncements")
+        .action((_, conf) => conf.copy(command = ListAnnouncements))
+        .text(s"Lists all announcement names"),
+      cmd("createenumannouncement")
         .action((_, conf) =>
-          conf.copy(command = CreateEnumEvent("", new Date(), Seq.empty)))
-        .text("Registers an oracle enum event")
+          conf.copy(command =
+            CreateEnumAnnouncement("", new Date(), Seq.empty)))
+        .text("Registers an oracle enum announcement")
         .children(
           arg[String]("label")
-            .text("Label for this event")
+            .text("Label for this announcement")
             .required()
             .action((label, conf) =>
               conf.copy(command = conf.command match {
-                case createEvent: CreateEnumEvent =>
+                case createEvent: CreateEnumAnnouncement =>
                   createEvent.copy(label = label)
                 case other => other
               })),
@@ -1272,7 +1311,7 @@ object ConsoleCli {
             .required()
             .action((date, conf) =>
               conf.copy(command = conf.command match {
-                case createEvent: CreateEnumEvent =>
+                case createEvent: CreateEnumAnnouncement =>
                   createEvent.copy(maturationTime = date)
                 case other => other
               })),
@@ -1281,27 +1320,28 @@ object ConsoleCli {
             .required()
             .action((outcomes, conf) =>
               conf.copy(command = conf.command match {
-                case createEvent: CreateEnumEvent =>
+                case createEvent: CreateEnumAnnouncement =>
                   createEvent.copy(outcomes = outcomes)
                 case other => other
               }))
         ),
-      cmd("createnumericevent")
+      cmd("createnumericannouncement")
         .action((_, conf) =>
-          conf.copy(command = CreateNumericEvent(eventName = "",
-                                                 maturationTime = new Date(),
-                                                 minValue = 0,
-                                                 maxValue = 0,
-                                                 unit = "",
-                                                 precision = 0)))
-        .text("Registers an oracle event that uses digit decomposition when signing the number")
+          conf.copy(command = CreateNumericAnnouncement(eventName = "",
+                                                        maturationTime =
+                                                          new Date(),
+                                                        minValue = 0,
+                                                        maxValue = 0,
+                                                        unit = "",
+                                                        precision = 0)))
+        .text("Registers an oracle announcement that uses digit decomposition when signing the number")
         .children(
           arg[String]("name")
-            .text("Name for this event")
+            .text("Name for this announcement")
             .required()
             .action((name, conf) =>
               conf.copy(command = conf.command match {
-                case createNumericEvent: CreateNumericEvent =>
+                case createNumericEvent: CreateNumericAnnouncement =>
                   createNumericEvent.copy(eventName = name)
                 case other => other
               })),
@@ -1310,25 +1350,25 @@ object ConsoleCli {
             .required()
             .action((date, conf) =>
               conf.copy(command = conf.command match {
-                case createNumericEvent: CreateNumericEvent =>
+                case createNumericEvent: CreateNumericAnnouncement =>
                   createNumericEvent.copy(maturationTime = date)
                 case other => other
               })),
           arg[Long]("minvalue")
-            .text("Minimum value of this event")
+            .text("Minimum value of this announcement")
             .required()
             .action((min, conf) =>
               conf.copy(command = conf.command match {
-                case createNumericEvent: CreateNumericEvent =>
+                case createNumericEvent: CreateNumericAnnouncement =>
                   createNumericEvent.copy(minValue = min)
                 case other => other
               })),
           arg[Long]("maxvalue")
-            .text("Maximum value of this event")
+            .text("Maximum value of this announcement")
             .required()
             .action((max, conf) =>
               conf.copy(command = conf.command match {
-                case createNumericEvent: CreateNumericEvent =>
+                case createNumericEvent: CreateNumericAnnouncement =>
                   createNumericEvent.copy(maxValue = max)
                 case other => other
               })),
@@ -1336,7 +1376,7 @@ object ConsoleCli {
             .text("The unit denomination of the outcome value")
             .action((unit, conf) =>
               conf.copy(command = conf.command match {
-                case createNumericEvent: CreateNumericEvent =>
+                case createNumericEvent: CreateNumericAnnouncement =>
                   createNumericEvent.copy(unit = unit)
                 case other => other
               })),
@@ -1346,28 +1386,28 @@ object ConsoleCli {
               "the composition of the digits to obtain the actual outcome value.")
             .action((precision, conf) =>
               conf.copy(command = conf.command match {
-                case createNumericEvent: CreateNumericEvent =>
+                case createNumericEvent: CreateNumericAnnouncement =>
                   createNumericEvent.copy(precision = precision)
                 case other => other
               }))
         ),
-      cmd("createdigitdecompevent")
+      cmd("createdigitdecompannouncement")
         .action((_, conf) =>
-          conf.copy(command = CreateDigitDecompEvent("",
-                                                     Instant.MIN,
-                                                     0,
-                                                     isSigned = false,
-                                                     0,
-                                                     "",
-                                                     0)))
-        .text("Registers an oracle event that uses digit decomposition when signing the number")
+          conf.copy(command = CreateDigitDecompAnnouncement("",
+                                                            Instant.MIN,
+                                                            0,
+                                                            isSigned = false,
+                                                            0,
+                                                            "",
+                                                            0)))
+        .text("Registers an oracle announcement that uses digit decomposition when signing the number")
         .children(
           arg[String]("name")
-            .text("Name for this event")
+            .text("Name for this announcement")
             .required()
             .action((name, conf) =>
               conf.copy(command = conf.command match {
-                case createLargeRangedEvent: CreateDigitDecompEvent =>
+                case createLargeRangedEvent: CreateDigitDecompAnnouncement =>
                   createLargeRangedEvent.copy(eventName = name)
                 case other => other
               })),
@@ -1376,7 +1416,7 @@ object ConsoleCli {
             .required()
             .action((time, conf) =>
               conf.copy(command = conf.command match {
-                case createLargeRangedEvent: CreateDigitDecompEvent =>
+                case createLargeRangedEvent: CreateDigitDecompAnnouncement =>
                   createLargeRangedEvent.copy(maturationTime = time)
                 case other => other
               })),
@@ -1385,7 +1425,7 @@ object ConsoleCli {
             .required()
             .action((base, conf) =>
               conf.copy(command = conf.command match {
-                case createLargeRangedEvent: CreateDigitDecompEvent =>
+                case createLargeRangedEvent: CreateDigitDecompAnnouncement =>
                   createLargeRangedEvent.copy(base = base)
                 case other => other
               })),
@@ -1393,7 +1433,7 @@ object ConsoleCli {
             .text("The max number of digits the outcome can have")
             .action((num, conf) =>
               conf.copy(command = conf.command match {
-                case createLargeRangedEvent: CreateDigitDecompEvent =>
+                case createLargeRangedEvent: CreateDigitDecompAnnouncement =>
                   createLargeRangedEvent.copy(numDigits = num)
                 case other => other
               })),
@@ -1401,7 +1441,7 @@ object ConsoleCli {
             .text("Whether the outcomes can be negative")
             .action((_, conf) =>
               conf.copy(command = conf.command match {
-                case createLargeRangedEvent: CreateDigitDecompEvent =>
+                case createLargeRangedEvent: CreateDigitDecompAnnouncement =>
                   createLargeRangedEvent.copy(isSigned = true)
                 case other => other
               })),
@@ -1409,7 +1449,7 @@ object ConsoleCli {
             .text("The unit denomination of the outcome value")
             .action((unit, conf) =>
               conf.copy(command = conf.command match {
-                case createRangedEvent: CreateDigitDecompEvent =>
+                case createRangedEvent: CreateDigitDecompAnnouncement =>
                   createRangedEvent.copy(unit = unit)
                 case other => other
               })),
@@ -1419,35 +1459,63 @@ object ConsoleCli {
               "the composition of the digits to obtain the actual outcome value.")
             .action((precision, conf) =>
               conf.copy(command = conf.command match {
-                case createLargeRangedEvent: CreateDigitDecompEvent =>
+                case createLargeRangedEvent: CreateDigitDecompAnnouncement =>
                   createLargeRangedEvent.copy(precision = precision)
                 case other => other
               }))
         ),
-      cmd("getevent")
-        .action((_, conf) => conf.copy(command = GetEvent("")))
-        .text("Get an event's details")
+      cmd("deleteannouncement")
+        .action((_, conf) => conf.copy(command = DeleteAnnouncement("")))
+        .text("Delete an announcement. WARNING: THIS CAN LEAD TO DLCs NOT SETTLING IF USERS HAVE BUILT DLCS OFF OF THIS ANNOUNCEMENT. USE WITH CARE.")
         .children(
           arg[String]("eventName")
             .text("The event's name")
             .required()
             .action((eventName, conf) =>
               conf.copy(command = conf.command match {
-                case getEvent: GetEvent =>
+                case delete: DeleteAnnouncement =>
+                  delete.copy(eventName = eventName)
+                case other => other
+              }))
+        ),
+      cmd("deleteattestation")
+        .action((_, conf) => conf.copy(command = DeleteAttestation("")))
+        .text("Delete an announcement. WARNING THIS CAN LEAD TO PRIVATE KEY LEAK IF YOU SIGN ANOTHER ATTESTATION AFTER DELETING A PREVIOUS ONE. USE WITH CARE.")
+        .children(
+          arg[String]("eventName")
+            .text("The event's name")
+            .required()
+            .action((eventName, conf) =>
+              conf.copy(command = conf.command match {
+                case delete: DeleteAttestation =>
+                  delete.copy(eventName = eventName)
+                case other => other
+              }))
+        ),
+      cmd("getannouncement")
+        .action((_, conf) => conf.copy(command = GetAnnouncement("")))
+        .text("Get an announcement's details")
+        .children(
+          arg[String]("announcementName")
+            .text("The announcement's name")
+            .required()
+            .action((eventName, conf) =>
+              conf.copy(command = conf.command match {
+                case getEvent: GetAnnouncement =>
                   getEvent.copy(eventName = eventName)
                 case other => other
               }))
         ),
-      cmd("signevent")
-        .action((_, conf) => conf.copy(command = SignEvent("", "")))
-        .text("Signs an event")
+      cmd("signenum")
+        .action((_, conf) => conf.copy(command = SignEnum("", "")))
+        .text("Creates attestations for an announcement")
         .children(
-          arg[String]("eventName")
-            .text("The event's name")
+          arg[String]("announcementName")
+            .text("The announcement's name")
             .required()
             .action((eventName, conf) =>
               conf.copy(command = conf.command match {
-                case signEvent: SignEvent =>
+                case signEvent: SignEnum =>
                   signEvent.copy(eventName = eventName)
                 case other => other
               })),
@@ -1456,17 +1524,17 @@ object ConsoleCli {
             .required()
             .action((outcome, conf) =>
               conf.copy(command = conf.command match {
-                case signEvent: SignEvent =>
+                case signEvent: SignEnum =>
                   signEvent.copy(outcome = outcome)
                 case other => other
               }))
         ),
       cmd("signdigits")
         .action((_, conf) => conf.copy(command = SignDigits("", 0)))
-        .text("Signs a large range event")
+        .text("Signs the digits of a numeric announcement")
         .children(
-          arg[String]("eventName")
-            .text("The event's name")
+          arg[String]("announcementName")
+            .text("The announcement's name")
             .required()
             .action((eventName, conf) =>
               conf.copy(command = conf.command match {
@@ -1488,7 +1556,7 @@ object ConsoleCli {
         .action((_, conf) => conf.copy(command = GetSignatures("")))
         .text("Get the signatures from a signed event")
         .children(
-          arg[String]("eventName")
+          arg[String]("announcementName")
             .text("The event's name")
             .required()
             .action((eventName, conf) =>
@@ -1509,6 +1577,37 @@ object ConsoleCli {
               conf.copy(command = conf.command match {
                 case signMessage: SignMessage =>
                   signMessage.copy(message = msg)
+                case other => other
+              }))
+        ),
+      cmd("getoraclename")
+        .action((_, conf) => conf.copy(command = GetOracleName))
+        .text("Returns the oracle's name"),
+      cmd("setoraclename")
+        .action((_, conf) => conf.copy(command = SetOracleName(null)))
+        .text("Sets the oracle's name")
+        .children(
+          arg[String]("name")
+            .text("Oracle name")
+            .required()
+            .action((name, conf) =>
+              conf.copy(command = conf.command match {
+                case wps: SetOracleName =>
+                  wps.copy(name = name)
+                case other => other
+              }))
+        ),
+      cmd("backuporacle")
+        .action((_, conf) => conf.copy(command = BackupOracle(null)))
+        .text("Backs up the oracle SQLite database")
+        .children(
+          arg[String]("dest")
+            .text("Destination file name")
+            .required()
+            .action((dest, conf) =>
+              conf.copy(command = conf.command match {
+                case wps: BackupOracle =>
+                  wps.copy(destination = dest)
                 case other => other
               }))
         ),
@@ -1565,7 +1664,7 @@ object ConsoleCli {
                 case other => other
               }))),
       checkConfig {
-        case Config(NoCommand, _, _, _) =>
+        case Config(NoCommand, _, _, _, _) =>
           failure("You need to provide a command!")
         case _ => success
       }
@@ -1599,6 +1698,8 @@ object ConsoleCli {
     val requestParam: RequestParam = command match {
       case GetInfo =>
         RequestParam("getinfo")
+      case GetMedianTimePast =>
+        RequestParam("getmediantimepast")
       case GetUtxos =>
         RequestParam("getutxos")
       case ListReservedUtxos =>
@@ -1817,24 +1918,28 @@ object ConsoleCli {
       // Oracle
       case GetPublicKey =>
         RequestParam("getpublickey")
+      case GetOracleName =>
+        RequestParam("getoraclename")
+      case SetOracleName(oracleName) =>
+        RequestParam("setoraclename", Seq(up.writeJs(oracleName)))
       case GetStakingAddress =>
         RequestParam("getstakingaddress")
-      case ListEvents =>
-        RequestParam("listevents")
-      case GetEvent(eventName) =>
-        RequestParam("getevent", Seq(up.writeJs(eventName)))
-      case CreateEnumEvent(label, time, outcomes) =>
+      case ListAnnouncements =>
+        RequestParam("listannouncements")
+      case GetAnnouncement(eventName) =>
+        RequestParam("getannouncement", Seq(up.writeJs(eventName)))
+      case CreateEnumAnnouncement(label, time, outcomes) =>
         RequestParam(
-          "createenumevent",
+          "createenumannouncement",
           Seq(up.writeJs(label), up.writeJs(time), up.writeJs(outcomes)))
-      case CreateNumericEvent(eventName,
-                              time,
-                              minValue,
-                              maxValue,
-                              unit,
-                              precision) =>
+      case CreateNumericAnnouncement(eventName,
+                                     time,
+                                     minValue,
+                                     maxValue,
+                                     unit,
+                                     precision) =>
         RequestParam(
-          "createnumericevent",
+          "createnumericannouncement",
           Seq(up.writeJs(eventName),
               up.writeJs(time),
               up.writeJs(minValue),
@@ -1842,15 +1947,15 @@ object ConsoleCli {
               up.writeJs(unit),
               up.writeJs(precision))
         )
-      case CreateDigitDecompEvent(eventName,
-                                  time,
-                                  base,
-                                  isSigned,
-                                  numDigits,
-                                  unit,
-                                  precision) =>
+      case CreateDigitDecompAnnouncement(eventName,
+                                         time,
+                                         base,
+                                         isSigned,
+                                         numDigits,
+                                         unit,
+                                         precision) =>
         RequestParam(
-          "createdigitdecompevent",
+          "createdigitdecompannouncement",
           Seq(up.writeJs(eventName),
               up.writeJs(time),
               up.writeJs(base),
@@ -1859,8 +1964,8 @@ object ConsoleCli {
               up.writeJs(unit),
               up.writeJs(precision))
         )
-      case SignEvent(eventName, outcome) =>
-        RequestParam("signevent",
+      case SignEnum(eventName, outcome) =>
+        RequestParam("signenum",
                      Seq(up.writeJs(eventName), up.writeJs(outcome)))
       case SignDigits(eventName, num) =>
         RequestParam("signdigits", Seq(up.writeJs(eventName), up.writeJs(num)))
@@ -1869,6 +1974,13 @@ object ConsoleCli {
 
       case SignMessage(message) =>
         RequestParam("signmessage", Seq(up.writeJs(message)))
+
+      case DeleteAnnouncement(eventName) =>
+        RequestParam("deleteannouncement", Seq(up.writeJs(eventName)))
+      case DeleteAttestation(eventName) =>
+        RequestParam("deleteattestation", Seq(up.writeJs(eventName)))
+      case BackupOracle(dest) =>
+        RequestParam("backuporacle", Seq(up.writeJs(dest)))
 
       case CreateMultisig(requiredKeys, keys, addressType) =>
         RequestParam("createmultisig",
@@ -1885,6 +1997,12 @@ object ConsoleCli {
         // skip sending to server and just return version number of cli
         return Success(EnvUtil.getVersion)
 
+      case CreateContractInfo(ann, totalCollateral, contractDescriptor) =>
+        val args = Seq(up.writeJs(ann),
+                       up.writeJs(totalCollateral),
+                       up.writeJs(contractDescriptor))
+        RequestParam("createcontractinfo", args)
+
       case NoCommand => ???
     }
 
@@ -1896,6 +2014,8 @@ object ConsoleCli {
         sttp
           .post(uri"http://$host:${config.rpcPort}/")
           .contentType("application/json")
+          .auth
+          .basic("bitcoins", config.rpcPassword)
           .body {
             val uuid = java.util.UUID.randomUUID.toString
             val paramsWithID: Map[String, ujson.Value] =
@@ -1920,7 +2040,10 @@ object ConsoleCli {
         Try(ujson.read(rawBody).obj)
           .transform[mutable.LinkedHashMap[String, ujson.Value]](
             Success(_),
-            _ => error(s"Response was not a JSON object! Got: $rawBody"))
+            _ =>
+              Success(
+                mutable.LinkedHashMap[String, ujson.Value](
+                  "error" -> Str(rawBody))))
 
       /** Gets the given key from jsObj if it exists
         * and is not null
@@ -1973,7 +2096,8 @@ case class Config(
     command: CliCommand = CliCommand.NoCommand,
     network: Option[NetworkParameters] = None,
     debug: Boolean = false,
-    rpcPortOpt: Option[Int] = None) {
+    rpcPortOpt: Option[Int] = None,
+    rpcPassword: String = "") {
 
   val rpcPort: Int = rpcPortOpt match {
     case Some(port) => port
@@ -2093,6 +2217,21 @@ object CliCommand {
 
   case object GetDLCs extends AppServerCliCommand
   case class GetDLC(dlcId: Sha256Digest) extends AppServerCliCommand
+
+  case class CreateContractInfo(
+      announcementTLV: OracleAnnouncementTLV,
+      totalCollateral: Satoshis,
+      contractDescriptor: ujson.Value)
+      extends AppServerCliCommand
+
+  object CreateContractInfo {
+
+    lazy val empty: CreateContractInfo = {
+      CreateContractInfo(announcementTLV = OracleAnnouncementV0TLV.dummy,
+                         totalCollateral = Satoshis.zero,
+                         contractDescriptor = ujson.Null)
+    }
+  }
 
   sealed trait SendCliCommand extends AppServerCliCommand {
     def destination: BitcoinAddress
@@ -2216,6 +2355,8 @@ object CliCommand {
   case class GetBlockHeader(hash: DoubleSha256DigestBE)
       extends AppServerCliCommand
 
+  case object GetMedianTimePast extends AppServerCliCommand
+
   case class DecodeRawTransaction(transaction: Transaction)
       extends AppServerCliCommand
 
@@ -2250,17 +2391,17 @@ object CliCommand {
   // Oracle
   case object GetPublicKey extends OracleServerCliCommand
   case object GetStakingAddress extends OracleServerCliCommand
-  case object ListEvents extends OracleServerCliCommand
+  case object ListAnnouncements extends OracleServerCliCommand
 
-  case class GetEvent(eventName: String) extends OracleServerCliCommand
+  case class GetAnnouncement(eventName: String) extends OracleServerCliCommand
 
-  case class CreateEnumEvent(
+  case class CreateEnumAnnouncement(
       label: String,
       maturationTime: Date,
       outcomes: Seq[String])
       extends OracleServerCliCommand
 
-  case class CreateNumericEvent(
+  case class CreateNumericAnnouncement(
       eventName: String,
       maturationTime: Date,
       minValue: Long,
@@ -2269,7 +2410,7 @@ object CliCommand {
       precision: Int)
       extends OracleServerCliCommand
 
-  case class CreateDigitDecompEvent(
+  case class CreateDigitDecompAnnouncement(
       eventName: String,
       maturationTime: Instant,
       base: Int,
@@ -2279,7 +2420,7 @@ object CliCommand {
       precision: Int)
       extends OracleServerCliCommand
 
-  case class SignEvent(eventName: String, outcome: String)
+  case class SignEnum(eventName: String, outcome: String)
       extends OracleServerCliCommand
 
   case class SignDigits(eventName: String, num: Long)
@@ -2288,4 +2429,15 @@ object CliCommand {
   case class GetSignatures(eventName: String) extends OracleServerCliCommand
 
   case class SignMessage(message: String) extends OracleServerCliCommand
+
+  case class DeleteAnnouncement(eventName: String)
+      extends OracleServerCliCommand
+
+  case class DeleteAttestation(eventName: String) extends OracleServerCliCommand
+
+  case class BackupOracle(destination: String) extends OracleServerCliCommand
+
+  case object GetOracleName extends OracleServerCliCommand
+
+  case class SetOracleName(name: String) extends OracleServerCliCommand
 }

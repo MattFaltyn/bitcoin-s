@@ -3,7 +3,7 @@ title: Wallet Callbacks
 id: wallet-callbacks
 ---
 
-#### Callbacks
+#### Wallet Callbacks
 
 Bitcoin-S support call backs for the following events that happen in the wallet:
 
@@ -11,11 +11,20 @@ Bitcoin-S support call backs for the following events that happen in the wallet:
 2. onTransactionBroadcast
 3. onReservedUtxos
 4. onNewAddressGenerated
+5. onBlockProcessed
 
 That means every time one of these events happens, we will call your callback
 so that you can be notified of the event. These callbacks will be run after the message has been
 recieved and will execute synchronously. If any of them fail an error log will be output, and the remainder of the callbacks will continue.
 Let's make an easy one:
+
+#### DLC Wallet callbacks
+Bitcoin-s support callbacks for the following events in the DLC wallet: 
+1. onStateChange
+
+That means everytime a DLC's state changes, your callback will be executed so
+that you are notified of the event. For instance, if your DLC transitions from
+`Offered` -> `Accepted`, your callback will be executed.
 
 #### Example
 
@@ -27,13 +36,11 @@ import org.bitcoins.crypto._
 import org.bitcoins.core.protocol.transaction.Transaction
 import org.bitcoins.core.wallet.fee._
 import org.bitcoins.feeprovider._
-import org.bitcoins.keymanager.bip39.BIP39KeyManager
 import org.bitcoins.rpc.client.v19.BitcoindV19RpcClient
 import org.bitcoins.rpc.config.BitcoindInstanceLocal
 import org.bitcoins.testkit.BitcoinSTestAppConfig
 import org.bitcoins.wallet._
 import org.bitcoins.wallet.config.WalletAppConfig
-import java.time.Instant
 import scala.concurrent.{ExecutionContextExecutor, Future}
 ```
 
@@ -50,17 +57,6 @@ implicit val walletConf: WalletAppConfig =
 val bitcoind = BitcoindV19RpcClient(BitcoindInstanceLocal.fromConfFile())
 val aesPasswordOpt = Some(AesPassword.fromString("password"))
 
-// Create our key manager
-  val keyManagerE = BIP39KeyManager.initialize(aesPasswordOpt = aesPasswordOpt,
-                                               kmParams = walletConf.kmParams,
-                                               bip39PasswordOpt = None)
-
-val keyManager = keyManagerE match {
-    case Right(keyManager) => keyManager
-    case Left(err) =>
-      throw new RuntimeException(s"Cannot initialize key manager err=$err")
-  }
-
 // Here is a super simple example of a callback, this could be replaced with anything, from
 // relaying the transaction on the network, finding relevant wallet outputs, verifying the transaction,
 // or writing it to disk
@@ -73,11 +69,10 @@ val exampleCallbacks = WalletCallbacks(
 
 // Now we can create a wallet
 val wallet =
-    Wallet(keyManager = keyManager,
+    Wallet(
            nodeApi = bitcoind,
            chainQueryApi = bitcoind,
-           feeRateApi = ConstantFeeRateProvider(SatoshisPerVirtualByte.one),
-           creationTime = Instant.now)
+           feeRateApi = ConstantFeeRateProvider(SatoshisPerVirtualByte.one))
 
 // Finally, we can add the callbacks to our wallet config
 walletConf.addCallbacks(exampleCallbacks)

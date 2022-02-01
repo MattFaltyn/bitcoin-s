@@ -11,10 +11,11 @@ import scala.concurrent.{ExecutionContext, Future}
 case class DLCAnnouncementPrimaryKey(dlcId: Sha256Digest, announcementId: Long)
 
 case class DLCAnnouncementDAO()(implicit
-    val ec: ExecutionContext,
+    override val ec: ExecutionContext,
     override val appConfig: DLCAppConfig)
     extends CRUD[DLCAnnouncementDb, DLCAnnouncementPrimaryKey]
-    with SlickUtil[DLCAnnouncementDb, DLCAnnouncementPrimaryKey] {
+    with SlickUtil[DLCAnnouncementDb, DLCAnnouncementPrimaryKey]
+    with DLCIdDaoUtilNoPK[DLCAnnouncementDb] {
   private val mappers = new org.bitcoins.db.DbCommonsColumnMappers(profile)
   import mappers._
   import profile.api._
@@ -76,20 +77,32 @@ case class DLCAnnouncementDAO()(implicit
 
   def findByAnnouncementIds(
       ids: Vector[Long]): Future[Vector[DLCAnnouncementDb]] = {
+    val action = findByAnnouncementIdsAction(ids)
+    safeDatabase.runVec(action)
+  }
+
+  def findByAnnouncementIdsAction(ids: Vector[Long]): DBIOAction[
+    Vector[DLCAnnouncementDb],
+    NoStream,
+    Effect.Read] = {
     val query = table.filter(_.announcementId.inSet(ids))
-
-    safeDatabase.runVec(query.result)
+    query.result.map(_.toVector)
   }
 
-  def findByDLCId(dlcId: Sha256Digest): Future[Vector[DLCAnnouncementDb]] = {
-    val query = table.filter(_.dlcId === dlcId)
-
-    safeDatabase.runVec(query.result)
-  }
-
-  def deleteByDLCId(dlcId: Sha256Digest): Future[Int] = {
+  override def findByDLCIdAction(dlcId: Sha256Digest): DBIOAction[
+    Vector[DLCAnnouncementDb],
+    profile.api.NoStream,
+    profile.api.Effect.Read] = {
     val q = table.filter(_.dlcId === dlcId)
-    safeDatabase.run(q.delete)
+    q.result.map(_.toVector)
+  }
+
+  override def deleteByDLCIdAction(dlcId: Sha256Digest): DBIOAction[
+    Int,
+    profile.api.NoStream,
+    profile.api.Effect.Write] = {
+    val q = table.filter(_.dlcId === dlcId)
+    q.delete
   }
 
   class DLCAnnouncementTable(tag: Tag)

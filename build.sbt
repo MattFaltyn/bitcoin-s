@@ -30,7 +30,8 @@ lazy val commonJsSettings = {
     scalaJSLinkerConfig ~= {
       _.withModuleKind(ModuleKind.CommonJSModule)
     }
-  ) ++ CommonSettings.settings
+  ) ++ CommonSettings.settings ++ Seq(
+    scalacOptions += "-P:scalajs:nowarnGlobalExecutionContext")
 }
 
 lazy val crypto = crossProject(JVMPlatform, JSPlatform)
@@ -137,6 +138,11 @@ lazy val lndRpc = project
   .settings(CommonSettings.prodSettings: _*)
   .dependsOn(asyncUtilsJVM, bitcoindRpc)
 
+lazy val clightningRpc = project
+  .in(file("clightning-rpc"))
+  .settings(CommonSettings.prodSettings: _*)
+  .dependsOn(asyncUtilsJVM, bitcoindRpc)
+
 lazy val tor = project
   .in(file("tor"))
   .settings(CommonSettings.prodSettings: _*)
@@ -179,6 +185,8 @@ lazy val `bitcoin-s` = project
     dbCommonsTest,
     feeProvider,
     feeProviderTest,
+    esplora,
+    esploraTest,
     dlcOracle,
     dlcOracleTest,
     dlcTest,
@@ -215,7 +223,9 @@ lazy val `bitcoin-s` = project
     lndRpcTest,
     tor,
     torTest,
-    scripts
+    scripts,
+    clightningRpc,
+    clightningRpcTest
   )
   .dependsOn(
     secp256k1jni,
@@ -235,6 +245,8 @@ lazy val `bitcoin-s` = project
     dbCommonsTest,
     feeProvider,
     feeProviderTest,
+    esplora,
+    esploraTest,
     dlcOracle,
     dlcOracleTest,
     dlcTest,
@@ -269,7 +281,9 @@ lazy val `bitcoin-s` = project
     lndRpcTest,
     tor,
     torTest,
-    scripts
+    scripts,
+    clightningRpc,
+    clightningRpcTest
   )
   .settings(CommonSettings.settings: _*)
   // unidoc aggregates Scaladocs for all subprojects into one big doc
@@ -464,7 +478,7 @@ lazy val dbCommons = project
     name := "bitcoin-s-db-commons",
     libraryDependencies ++= Deps.dbCommons.value
   )
-  .dependsOn(coreJVM, appCommons)
+  .dependsOn(coreJVM, appCommons, keyManager)
 
 lazy val dbCommonsTest = project
   .in(file("db-commons-test"))
@@ -473,6 +487,24 @@ lazy val dbCommonsTest = project
     name := "bitcoin-s-db-commons-test"
   )
   .dependsOn(testkit)
+
+lazy val esplora = project
+  .in(file("esplora"))
+  .settings(CommonSettings.prodSettings: _*)
+  .settings(
+    name := "bitcoin-s-esplora",
+    libraryDependencies ++= Deps.esplora.value
+  )
+  .dependsOn(coreJVM, appCommons, tor)
+
+lazy val esploraTest = project
+  .in(file("esplora-test"))
+  .settings(CommonSettings.testSettings: _*)
+  .settings(
+    name := "bitcoin-s-esplora-test",
+    libraryDependencies ++= Deps.esploraTest.value
+  )
+  .dependsOn(coreJVM % testAndCompile, esplora, testkit)
 
 lazy val feeProvider = project
   .in(file("fee-provider"))
@@ -541,6 +573,15 @@ lazy val eclairRpcTest = project
   )
   .dependsOn(coreJVM % testAndCompile, testkit)
 
+lazy val clightningRpcTest = project
+  .in(file("clightning-rpc-test"))
+  .settings(CommonSettings.testSettings: _*)
+  .settings(
+    libraryDependencies ++= Deps.clightningRpcTest.value,
+    name := "bitcoin-s-clightning-rpc-test"
+  )
+  .dependsOn(coreJVM % testAndCompile, clightningRpc, testkit)
+
 lazy val lndRpcTest = project
   .in(file("lnd-rpc-test"))
   .settings(CommonSettings.testSettings: _*)
@@ -605,6 +646,7 @@ lazy val testkit = project
     bitcoindRpc,
     eclairRpc,
     lndRpc,
+    clightningRpc,
     node,
     wallet,
     dlcWallet,

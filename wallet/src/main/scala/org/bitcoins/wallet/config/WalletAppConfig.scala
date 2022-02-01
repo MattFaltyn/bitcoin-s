@@ -8,14 +8,13 @@ import org.bitcoins.core.api.feeprovider.FeeRateApi
 import org.bitcoins.core.api.node.NodeApi
 import org.bitcoins.core.hd._
 import org.bitcoins.core.util.Mutable
-import org.bitcoins.core.wallet.keymanagement.{
-  KeyManagerInitializeError,
-  KeyManagerParams
-}
+import org.bitcoins.core.wallet.keymanagement._
+import org.bitcoins.core.wallet.fee.SatoshisPerVirtualByte
 import org.bitcoins.crypto.AesPassword
 import org.bitcoins.db.DatabaseDriver.{PostgreSQL, SQLite}
 import org.bitcoins.db._
-import org.bitcoins.keymanager.bip39.{BIP39KeyManager, BIP39LockedKeyManager}
+import org.bitcoins.db.models.MasterXPubDAO
+import org.bitcoins.db.util.{DBMasterXPubApi, MasterXPubUtil}
 import org.bitcoins.keymanager.config.KeyManagerAppConfig
 import org.bitcoins.tor.config.TorAppConfig
 import org.bitcoins.wallet.config.WalletAppConfig.RebroadcastTransactionsRunnable
@@ -24,14 +23,7 @@ import org.bitcoins.wallet.models.AccountDAO
 import org.bitcoins.wallet.{Wallet, WalletCallbacks, WalletLogger}
 
 import java.nio.file.{Files, Path, Paths}
-import java.util.concurrent.{
-  ExecutorService,
-  Executors,
-  ScheduledExecutorService,
-  ScheduledFuture,
-  ThreadFactory,
-  TimeUnit
-}
+import java.util.concurrent._
 import scala.concurrent.duration.{Duration, DurationInt, FiniteDuration}
 import scala.concurrent.{Await, ExecutionContext, Future}
 
@@ -39,13 +31,12 @@ import scala.concurrent.{Await, ExecutionContext, Future}
   * @param directory The data directory of the wallet
   * @param conf Optional sequence of configuration overrides
   */
-case class WalletAppConfig(
-    private val directory: Path,
-    private val conf: Config*)(implicit override val ec: ExecutionContext)
+case class WalletAppConfig(baseDatadir: Path, configOverrides: Vector[Config])(
+    implicit override val ec: ExecutionContext)
     extends DbAppConfig
     with WalletDbManagement
-    with JdbcProfileComponent[WalletAppConfig] {
-  override protected[bitcoins] def configOverrides: List[Config] = conf.toList
+    with JdbcProfileComponent[WalletAppConfig]
+    with DBMasterXPubApi {
 
   override protected[bitcoins] def moduleName: String =
     WalletAppConfig.moduleName
@@ -54,14 +45,12 @@ case class WalletAppConfig(
 
   override protected[bitcoins] def newConfigOfType(
       configs: Seq[Config]): WalletAppConfig =
-    WalletAppConfig(directory, configs: _*)
-
-  protected[bitcoins] def baseDatadir: Path = directory
+    WalletAppConfig(baseDatadir, configs.toVector)
 
   override def appConfig: WalletAppConfig = this
 
   lazy val torConf: TorAppConfig =
-    TorAppConfig(directory, conf: _*)
+    TorAppConfig(baseDatadir, Some(moduleName), configOverrides)
 
   private[wallet] lazy val scheduler: ScheduledExecutorService = {
     Executors.newScheduledThreadPool(
@@ -87,7 +76,7 @@ case class WalletAppConfig(
   }
 
   lazy val kmConf: KeyManagerAppConfig =
-    KeyManagerAppConfig(directory, conf: _*)
+    KeyManagerAppConfig(baseDatadir, configOverrides)
 
   lazy val defaultAccountKind: HDPurpose =
     config.getString("bitcoin-s.wallet.defaultAccountType") match {
@@ -130,6 +119,13 @@ case class WalletAppConfig(
     require(confs >= 1,
             s"requiredConfirmations cannot be less than 1, got: $confs")
     confs
+  }
+
+  lazy val longTermFeeRate: SatoshisPerVirtualByte = {
+    val feeRate = config.getInt("bitcoin-s.wallet.longTermFeeRate")
+    require(feeRate >= 0,
+            s"longTermFeeRate cannot be less than 0, got: $feeRate")
+    SatoshisPerVirtualByte.fromLong(feeRate)
   }
 
   lazy val rebroadcastFrequency: Duration = {
@@ -178,21 +174,32 @@ case class WalletAppConfig(
         None
     }
   }
+  private val masterXPubDAO: MasterXPubDAO = MasterXPubDAO()(ec, this)
 
   override def start(): Future[Unit] = {
+    if (Files.notExists(datadir)) {
+      Files.createDirectories(datadir)
+    }
+
     for {
       _ <- super.start()
+      _ <- kmConf.start()
+      masterXpub = kmConf.toBip39KeyManager.getRootXPub
+      numMigrations = migrate()
+      isExists <- seedExists()
+      _ <- {
+        logger.info(
+          s"Starting wallet with xpub=${masterXpub} walletName=${walletNameOpt}")
+        if (!isExists) {
+          masterXPubDAO
+            .create(masterXpub)
+            .map(_ => ())
+        } else {
+          MasterXPubUtil.checkMasterXPub(masterXpub, masterXPubDAO)
+        }
+      }
     } yield {
       logger.debug(s"Initializing wallet setup")
-
-      if (Files.notExists(datadir)) {
-        Files.createDirectories(datadir)
-      }
-
-      val numMigrations = {
-        migrate()
-      }
-
       if (isHikariLoggingEnabled) {
         //.get is safe because hikari logging is enabled
         startHikariLogger(hikariLoggingInterval.get)
@@ -216,10 +223,7 @@ case class WalletAppConfig(
   }
 
   /** The path to our encrypted mnemonic seed */
-  private[bitcoins] lazy val seedPath: Path = kmConf.seedPath
-
-  /** Checks if our wallet as a mnemonic seed associated with it */
-  def seedExists(): Boolean = kmConf.seedExists()
+  override lazy val seedPath: Path = kmConf.seedPath
 
   def kmParams: KeyManagerParams =
     KeyManagerParams(kmConf.seedPath, defaultAccountKind, network)
@@ -333,7 +337,7 @@ object WalletAppConfig
     */
   override def fromDatadir(datadir: Path, confs: Vector[Config])(implicit
       ec: ExecutionContext): WalletAppConfig =
-    WalletAppConfig(datadir, confs: _*)
+    WalletAppConfig(datadir, confs)
 
   /** Creates a wallet based on the given [[WalletAppConfig]] */
   def createHDWallet(
@@ -343,42 +347,17 @@ object WalletAppConfig
       walletConf: WalletAppConfig,
       ec: ExecutionContext): Future[Wallet] = {
     walletConf.hasWallet().flatMap { walletExists =>
-      val aesPasswordOpt = walletConf.aesPasswordOpt
       val bip39PasswordOpt = walletConf.bip39PasswordOpt
 
       if (walletExists) {
         logger.info(s"Using pre-existing wallet")
-        // TODO change me when we implement proper password handling
-        BIP39LockedKeyManager.unlock(aesPasswordOpt,
-                                     bip39PasswordOpt,
-                                     walletConf.kmParams) match {
-          case Right(km) =>
-            val wallet =
-              Wallet(km, nodeApi, chainQueryApi, feeRateApi, km.creationTime)
-            Future.successful(wallet)
-          case Left(err) =>
-            sys.error(s"Error initializing key manager, err=${err}")
-        }
+        val wallet =
+          Wallet(nodeApi, chainQueryApi, feeRateApi)
+        Future.successful(wallet)
       } else {
-        logger.info(s"Initializing key manager")
-        val keyManagerE: Either[KeyManagerInitializeError, BIP39KeyManager] =
-          BIP39KeyManager.initialize(aesPasswordOpt = aesPasswordOpt,
-                                     kmParams = walletConf.kmParams,
-                                     bip39PasswordOpt = bip39PasswordOpt)
-
-        val keyManager = keyManagerE match {
-          case Right(keyManager) => keyManager
-          case Left(err) =>
-            sys.error(s"Error initializing key manager, err=${err}")
-        }
-
         logger.info(s"Creating new wallet")
         val unInitializedWallet =
-          Wallet(keyManager,
-                 nodeApi,
-                 chainQueryApi,
-                 feeRateApi,
-                 keyManager.creationTime)
+          Wallet(nodeApi, chainQueryApi, feeRateApi)
 
         Wallet.initialize(wallet = unInitializedWallet,
                           bip39PasswordOpt = bip39PasswordOpt)
